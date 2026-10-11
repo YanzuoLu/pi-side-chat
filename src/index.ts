@@ -2,7 +2,7 @@
  * Codex's `/side` for Pi: an ephemeral side conversation forked from the current one.
  *
  * `/side` (or `/btw`) forks the conversation into a separate Pi process with the same model, thinking
- * level, extensions and session id, and shows its transcript in place of the parent's. Codex's hidden
+ * level, extensions and session id, and shows it in place of the parent's conversation. Codex's hidden
  * side instructions follow the inherited history, so the model answers questions without continuing
  * the parent's work. Ctrl+/ switches between the two without closing either, and Ctrl+C on an empty
  * editor closes the side conversation. Nothing of it is saved.
@@ -10,7 +10,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEndEvent, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { type SideEvent, SideProcess } from "./child.ts";
 import {
@@ -19,7 +19,7 @@ import {
 	SIDE_STARTING_CONTEXT_LABEL,
 } from "./codex.ts";
 import { forkSide, hasStarted } from "./fork.ts";
-import { findInteractiveMode, SideTranscript } from "./view.ts";
+import { findInteractiveMode, SideView } from "./view.ts";
 
 const KEY = "side-chat";
 const TOGGLE_LABEL = "ctrl + /";
@@ -27,7 +27,7 @@ const CLOSE_LABEL = "ctrl + c";
 const COMMANDS = ["side", "btw"];
 
 type Side = {
-	transcript: SideTranscript;
+	view: SideView;
 	process?: SideProcess;
 	directory: string;
 	/** Commands the side session runs itself, such as extension commands, prompt templates and skills. */
@@ -44,14 +44,14 @@ export default function sideChat(pi: ExtensionAPI): void {
 
 	/** Errors about the side conversation go to whichever transcript is shown. */
 	const notifyError = (message: string) => {
-		if (side?.transcript.visible) side.transcript.notify(message, "error");
+		if (side?.view.visible) side.view.notify(message, "error");
 		else ctx?.ui.notify(message, "error");
 	};
 
 	const updateLabel = (label?: string) => {
 		if (!ctx) return;
 		let text = label;
-		if (!text && side?.transcript.visible) {
+		if (!text && side?.view.visible) {
 			const parts = ["from main thread"];
 			if (side.parentStatus) parts.push(side.parentStatus);
 			parts.push(`${TOGGLE_LABEL} to switch`, `${CLOSE_LABEL} to close`);
@@ -63,12 +63,12 @@ export default function sideChat(pi: ExtensionAPI): void {
 	};
 
 	const show = (current: Side) => {
-		current.transcript.show((text) => submit(current, text));
+		current.view.show((text: string) => submit(current, text));
 		updateLabel();
 	};
 
 	const hide = (current: Side) => {
-		current.transcript.hide();
+		current.view.hide();
 		updateLabel();
 	};
 
@@ -76,7 +76,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 		const current = side;
 		if (!current) return;
 		side = undefined;
-		hide(current);
+		current.view.dispose();
+		updateLabel();
 		await current.process?.close();
 		rmSync(current.directory, { recursive: true, force: true });
 	};
@@ -96,13 +97,13 @@ export default function sideChat(pi: ExtensionAPI): void {
 	const handleEvent = (current: Side, event: SideEvent) => {
 		if (event.type === "agent_start") current.streaming = true;
 		if (event.type === "agent_end") current.streaming = false;
-		current.transcript.draw(event);
+		current.view.draw(event);
 	};
 
 	const open = async (context: ExtensionContext, message: string) => {
 		ctx = context;
 		if (side) {
-			if (!side.transcript.visible) show(side);
+			if (!side.view.visible) show(side);
 			if (message) submit(side, message);
 			return;
 		}
@@ -121,15 +122,14 @@ export default function sideChat(pi: ExtensionAPI): void {
 		}
 
 		const entries = forkSide({ ...header }, branch, !context.isIdle());
-		const transcript = new SideTranscript(
-			findInteractiveMode(context, KEY),
-			entries.slice(1) as SessionEntry[],
-			context.cwd,
-		);
+		const view = new SideView(findInteractiveMode(context, KEY), entries, {
+			model,
+			thinkingLevel: pi.getThinkingLevel(),
+		});
 		const directory = mkdtempSync(join(tmpdir(), "pi-side-chat-"));
 		const sessionFile = join(directory, "side.jsonl");
 		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-		const current: Side = { transcript, directory, commands: new Set(), streaming: false };
+		const current: Side = { view, directory, commands: new Set(), streaming: false };
 		side = current;
 		updateLabel(SIDE_STARTING_CONTEXT_LABEL);
 		try {
@@ -141,7 +141,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 				model: model.id,
 				thinking: pi.getThinkingLevel(),
 				ui: () => context.ui,
-				notify: (text, type) => transcript.notify(text, type),
+				notify: (text, type) => view.notify(text, type),
+				setStatus: (key, text) => view.setStatus(key, text),
 				onEvent: (event) => handleEvent(current, event),
 				onExit: (reason) => {
 					if (side !== current) return;
@@ -162,6 +163,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 		for (const info of await current.process.commands()) {
 			if (!COMMANDS.includes(info)) current.commands.add(info);
 		}
+		view.attach(current.process);
 		show(current);
 		if (message) submit(current, message);
 	};
@@ -172,18 +174,18 @@ export default function sideChat(pi: ExtensionAPI): void {
 		// Terminals with the kitty keyboard protocol also report releases, which would act a second time.
 		if (!current?.process || !ctx || isKeyRelease(data)) return undefined;
 		if (matchesKey(data, "ctrl+/") || matchesKey(data, "ctrl+7")) {
-			if (current.transcript.visible) hide(current);
+			if (current.view.visible) hide(current);
 			else show(current);
 			return { consume: true };
 		}
-		if (!current.transcript.visible || !current.transcript.editorFocused) return undefined;
+		if (!current.view.visible || !current.view.editorFocused) return undefined;
 		if (matchesKey(data, "ctrl+c") && ctx.ui.getEditorText() === "") {
 			void close();
 			return { consume: true };
 		}
 		if (matchesKey(data, "escape")) {
 			// Esc belongs to the side conversation here, never to the hidden parent.
-			if (current.streaming) current.process.abort().catch(() => {});
+			current.process.abort().catch(() => {});
 			return { consume: true };
 		}
 		return undefined;

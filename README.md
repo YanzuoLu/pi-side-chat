@@ -22,7 +22,8 @@ Only one side conversation is open at a time. It is never saved.
 - Codex's side-conversation instructions and boundary prompt follow the inherited history as one hidden message, verbatim. They tell the model to answer questions and avoid continuing or changing the main thread's work. If the main thread is in the middle of a turn, Codex's interrupted-turn marker comes first.
 - Extension state recorded in the main session is not inherited, so extensions in the side conversation start fresh instead of resuming the main thread's loops or plans.
 - The side conversation runs in its own Pi process. Its extensions cannot interfere with the main thread's, and closing it ends anything it started.
-- Its transcript is drawn by Pi itself, so it looks the same as the main thread. Extension dialogs and notifications from the side conversation show up in Pi. Its status bar entries and widgets are dropped.
+- Like switching threads in Codex, switching swaps everything that belongs to a conversation: the transcript, the working and compaction indicators, the footer and the editor's draft. Pi draws all of it, so the side conversation looks the same as the main thread.
+- Extension dialogs, notifications and footer status entries from the side conversation show up in Pi. Its widgets are dropped.
 - Slash commands that the side conversation cannot run itself are unavailable there, as in Codex.
 
 `ctrl + /` needs a terminal that reports it, such as one with the kitty keyboard protocol.
@@ -35,7 +36,7 @@ pi install git:github.com/YanzuoLu/pi-side-chat
 
 ## Compatibility
 
-Pi has no extension API for a second transcript, so `src/view.ts` uses Pi's interactive mode internals. It checks them when a side conversation opens and reports an error if a Pi release changes them.
+Pi has no extension API for a second conversation view, so `src/view.ts` uses Pi's interactive mode internals. It checks them when a side conversation opens and reports an error if a Pi release changes them.
 
 ## License
 

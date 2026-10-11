@@ -1,6 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { type ExtensionUIContext, parseArgs } from "@earendil-works/pi-coding-agent";
+import type { Model } from "@earendil-works/pi-ai";
+import { type ContextUsage, type ExtensionUIContext, parseArgs, type SessionEntry } from "@earendil-works/pi-coding-agent";
 
 /** A session event from the side process, as Pi's RPC mode prints it. */
 export type SideEvent = { type: string; [key: string]: unknown };
@@ -16,12 +17,22 @@ export interface SideProcessOptions {
 	ui: () => ExtensionUIContext;
 	/** Shows a notification from the side's extensions. */
 	notify: (message: string, type: NotifyType) => void;
+	/** Sets or clears a status entry from the side's extensions. */
+	setStatus: (key: string, text: string | undefined) => void;
 	onEvent: (event: SideEvent) => void;
 	/** Called when the process ends without being closed. */
 	onExit: (reason: string) => void;
 }
 
 export type NotifyType = "info" | "warning" | "error";
+
+/** What the footer shows about the side session. */
+export interface SideState {
+	model?: Model<any>;
+	thinkingLevel: string;
+	autoCompactionEnabled: boolean;
+	contextUsage?: ContextUsage;
+}
 
 type Response = { id?: string; success: boolean; data?: unknown; error?: string };
 
@@ -88,6 +99,21 @@ export class SideProcess {
 		return data.commands.map((command) => command.name);
 	}
 
+	/** The side session's entries after the one with id `since`. */
+	async entries(since: string): Promise<SessionEntry[]> {
+		const data = (await this.request({ type: "get_entries", since })) as { entries: SessionEntry[] };
+		return data.entries;
+	}
+
+	async state(): Promise<SideState> {
+		const [state, stats] = (await Promise.all([
+			this.request({ type: "get_state" }),
+			this.request({ type: "get_session_stats" }),
+		])) as [Omit<SideState, "contextUsage">, { contextUsage?: ContextUsage }];
+		return { ...state, contextUsage: stats.contextUsage };
+	}
+
+	/** Stops whatever the side session is doing: its turn, a retry or a compaction. */
 	async abort(): Promise<void> {
 		await this.request({ type: "abort" });
 	}
@@ -137,7 +163,7 @@ export class SideProcess {
 		}
 	}
 
-	/** Shows the side's extension dialogs and notifications. Its status bar entries, widgets and titles are dropped. */
+	/** Shows the side's extension dialogs, notifications and status entries. Its widgets and titles are dropped. */
 	private async answer(request: SideEvent): Promise<void> {
 		const ui = this.options.ui();
 		const id = request.id as string;
@@ -154,6 +180,8 @@ export class SideProcess {
 				return value(await ui.input(title, request.placeholder as string | undefined, opts));
 			case "editor":
 				return value(await ui.editor(title, request.prefill as string | undefined));
+			case "setStatus":
+				return this.options.setStatus(request.statusKey as string, request.statusText as string | undefined);
 			case "notify":
 				return this.options.notify(request.message as string, (request.notifyType as NotifyType | undefined) ?? "info");
 		}
