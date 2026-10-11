@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentEndEvent, ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
-import { matchesKey } from "@earendil-works/pi-tui";
+import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { type SideEvent, SideProcess } from "./child.ts";
 import {
 	SIDE_NO_STARTED_CONVERSATION_MESSAGE,
@@ -169,7 +169,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 	/** Ctrl+/ switches views, and in the side view Ctrl+C on an empty editor closes it and Esc stops it. */
 	const handleKey = (data: string): { consume: true } | undefined => {
 		const current = side;
-		if (!current?.process || !ctx) return undefined;
+		// Terminals with the kitty keyboard protocol also report releases, which would act a second time.
+		if (!current?.process || !ctx || isKeyRelease(data)) return undefined;
 		if (matchesKey(data, "ctrl+/") || matchesKey(data, "ctrl+7")) {
 			if (current.transcript.visible) hide(current);
 			else show(current);
