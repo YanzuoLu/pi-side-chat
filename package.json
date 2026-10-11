@@ -1,0 +1,48 @@
+{
+	"name": "pi-side-chat",
+	"version": "0.1.0",
+	"description": "Pi extension that brings Codex's /side conversations to Pi",
+	"type": "module",
+	"license": "MIT",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"side-conversation"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/YanzuoLu/pi-side-chat.git"
+	},
+	"homepage": "https://github.com/YanzuoLu/pi-side-chat#readme",
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "vitest --run",
+		"check": "npm run typecheck && npm run test"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "^0.87.1",
+		"@earendil-works/pi-coding-agent": "^0.87.1",
+		"@types/node": "^22.10.2",
+		"typescript": "^5.7.2",
+		"vitest": "^2.1.8",
+		"@earendil-works/pi-tui": "^0.87.1"
+	},
+	"engines": {
+		"node": ">=20"
+	}
+}
