@@ -121,6 +121,10 @@ export class SideProcess {
 		await this.request({ type: "set_model", provider, modelId });
 	}
 
+	async setSessionName(name: string): Promise<void> {
+		await this.request({ type: "set_session_name", name });
+	}
+
 	async setThinkingLevel(level: string): Promise<void> {
 		await this.request({ type: "set_thinking_level", level });
 	}

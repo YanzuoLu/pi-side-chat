@@ -1,17 +1,24 @@
 /**
- * Codex's `/side` for Pi: an ephemeral side conversation forked from the current one.
+ * Codex's `/side` for Pi: a side conversation forked from the current one.
  *
  * `/side` (or `/btw`) forks the conversation into a separate Pi process with the same model, thinking
- * level, extensions and session id, and shows it in place of the parent's conversation. Codex's hidden
+ * level and extensions, and shows it in place of the parent's conversation. Codex's hidden
  * side instructions follow the inherited history, so the model answers questions without continuing
  * the parent's work. Ctrl+/ switches between the two without closing either, and Ctrl+C on an empty
  * editor closes the side conversation. Ctrl+S closes it too, after it writes a handoff of what happened
- * in it, which is steered into the main thread. Nothing of it is saved.
+ * in it, which is steered into the main thread. A side conversation the user asked something in is
+ * saved as a session of its own, which `pi --session <id>` resumes like any other.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AgentEndEvent, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
+import {
+	type AgentEndEvent,
+	type ExtensionAPI,
+	type ExtensionContext,
+	getAgentDir,
+	SessionManager,
+} from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { type SideEvent, SideProcess } from "./child.ts";
 import {
@@ -19,7 +26,7 @@ import {
 	SIDE_SLASH_COMMAND_UNAVAILABLE_HINT,
 	SIDE_STARTING_CONTEXT_LABEL,
 } from "./codex.ts";
-import { forkSide, hasStarted } from "./fork.ts";
+import { forkSide, hasStarted, sideOrigin } from "./fork.ts";
 import { HANDOFF_PROMPT, handoffMessage, readHandoffConfig } from "./handoff.ts";
 import { findInteractiveMode, SideView } from "./view.ts";
 
@@ -32,9 +39,16 @@ const CONFIG_FILE = "pi-side-chat.json";
 const COMMANDS = ["side", "btw"];
 
 type Side = {
+	id: string;
 	view: SideView;
 	process?: SideProcess;
-	directory: string;
+	/** The side session's file, which stays once the user has asked something in it. */
+	sessionFile: string;
+	sessionDir: string;
+	/** A directory that holds the session of a parent that is not saved itself, removed on close. */
+	temporary?: string;
+	/** Whether the side session has a display name yet. */
+	named: boolean;
 	/** Commands the side session runs itself, such as extension commands, prompt templates and skills. */
 	commands: Set<string>;
 	streaming: boolean;
@@ -94,7 +108,9 @@ export default function sideChat(pi: ExtensionAPI): void {
 		current.view.dispose();
 		updateLabel();
 		await current.process?.close();
-		rmSync(current.directory, { recursive: true, force: true });
+		if (current.temporary) rmSync(current.temporary, { recursive: true, force: true });
+		else if (!current.asked) rmSync(current.sessionFile, { force: true });
+		else ctx?.ui.notify(`Side conversation saved. Resume it with: pi --session ${current.id}`, "info");
 	};
 
 	const submit = (current: Side, text: string) => {
@@ -107,6 +123,11 @@ export default function sideChat(pi: ExtensionAPI): void {
 			return;
 		}
 		current.process?.prompt(text, current.streaming).catch((error: Error) => notifyError(error.message));
+		if (!current.named) {
+			current.named = true;
+			const name = `Side: ${text.split("\n")[0]!.slice(0, 60)}`;
+			current.process?.setSessionName(name).catch((error: Error) => notifyError(error.message));
+		}
 	};
 
 	const handleEvent = (current: Side, event: SideEvent) => {
@@ -137,17 +158,25 @@ export default function sideChat(pi: ExtensionAPI): void {
 			return;
 		}
 
-		const entries = forkSide({ ...header }, branch, !context.isIdle());
+		// The side session sits next to the parent's, or in a temporary directory if the parent is not saved.
+		const parentFile = context.sessionManager.getSessionFile();
+		const temporary = parentFile ? undefined : mkdtempSync(join(tmpdir(), "pi-side-chat-"));
+		const sessionDir = temporary ?? context.sessionManager.getSessionDir();
+		const sideSession = SessionManager.create(context.cwd, sessionDir, { parentSession: parentFile });
+		const sessionFile = sideSession.getSessionFile()!;
+		const entries = forkSide(sideSession.getHeader()!, branch, !context.isIdle(), { parentSessionId: header.id });
 		const view = new SideView(findInteractiveMode(context, KEY), entries, {
 			model,
 			thinkingLevel: pi.getThinkingLevel(),
 		});
-		const directory = mkdtempSync(join(tmpdir(), "pi-side-chat-"));
-		const sessionFile = join(directory, "side.jsonl");
 		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 		const current: Side = {
+			id: sideSession.getSessionId(),
 			view,
-			directory,
+			sessionFile,
+			sessionDir,
+			temporary,
+			named: false,
 			commands: new Set(),
 			streaming: false,
 			model: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() },
@@ -161,7 +190,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 			current.process = await SideProcess.start({
 				cwd: context.cwd,
 				sessionFile,
-				sessionDir: directory,
+				sessionDir,
 				provider: model.provider,
 				model: model.id,
 				thinking: pi.getThinkingLevel(),
@@ -262,7 +291,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 
 	for (const name of COMMANDS) {
 		pi.registerCommand(name, {
-			description: "start a side conversation in an ephemeral fork",
+			description: "start a side conversation in a fork of this one",
 			handler: async (args, context) => {
 				if (context.mode !== "tui") {
 					context.ui.notify(`'/${name}' needs Pi's interactive mode`, "error");
@@ -273,8 +302,21 @@ export default function sideChat(pi: ExtensionAPI): void {
 		});
 	}
 
+	/** The parent's session id, when this session is a side conversation. */
+	let parentSessionId: string | undefined;
+
+	// OpenAI routes prompt caching by this key, which Pi sets to the session id. A side conversation,
+	// open or resumed later, keeps the parent's, whose cache already holds the history they share.
+	pi.on("before_provider_request", (event) => {
+		const payload = event.payload as { prompt_cache_key?: unknown };
+		if (parentSessionId && typeof payload.prompt_cache_key === "string") {
+			return { ...payload, prompt_cache_key: parentSessionId };
+		}
+	});
+
 	pi.on("session_start", (_event, context) => {
 		ctx = context;
+		parentSessionId = sideOrigin(context.sessionManager.getEntries())?.parentSessionId;
 		if (context.mode === "tui") stopKeys = context.ui.onTerminalInput(handleKey);
 	});
 

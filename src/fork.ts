@@ -15,16 +15,39 @@ export function hasStarted(branch: readonly SessionEntry[]): boolean {
 	return branch.some((entry) => entry.type === "message" && entry.message.role === "user");
 }
 
+/** What the opening message of a side conversation records about where it was forked from. */
+export interface SideOrigin {
+	parentSessionId: string;
+}
+
 /**
- * The session file of a side conversation forked from `branch`, header first.
+ * The parent session a side conversation was forked from, if these entries belong to one. A side
+ * conversation of a side conversation also carries its parent's opening, so the last one counts.
+ */
+export function sideOrigin(entries: readonly SessionEntry[]): SideOrigin | undefined {
+	for (const entry of [...entries].reverse()) {
+		if (entry.type === "custom_message" && entry.customType === SIDE_MESSAGE_TYPE && entry.details) {
+			return entry.details as SideOrigin;
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The session file of a side conversation forked from `branch`, with its own `header` first.
  *
- * It keeps the parent's session id and everything the model sees. Extension state entries (`custom`)
+ * It keeps everything the model sees. Extension state entries (`custom`)
  * are dropped so that extensions in the side conversation start fresh instead of resuming the parent's
  * loops and plans. Compactions that kept history from a dropped entry keep it from the next kept entry,
  * which contributes the same messages. A turn still running in the parent is marked as interrupted, as
  * Codex does, and the side instructions come last, ready for the first side message.
  */
-export function forkSide(header: SessionHeader, branch: readonly SessionEntry[], midTurn: boolean): FileEntry[] {
+export function forkSide(
+	header: SessionHeader,
+	branch: readonly SessionEntry[],
+	midTurn: boolean,
+	origin: SideOrigin,
+): FileEntry[] {
 	const kept = branch.filter((entry) => entry.type !== "custom");
 	const keptAfter = new Map<string, string | undefined>();
 	let next: string | undefined;
@@ -48,7 +71,7 @@ export function forkSide(header: SessionHeader, branch: readonly SessionEntry[],
 		}
 	}
 	if (midTurn) append(hiddenMessage(TURN_ABORTED_MARKER, entries));
-	append(hiddenMessage(SIDE_OPENING, entries));
+	append({ ...hiddenMessage(SIDE_OPENING, entries), details: origin });
 	return [header, ...entries];
 }
 

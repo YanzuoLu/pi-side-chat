@@ -1,7 +1,7 @@
 import { buildSessionContext, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { TURN_ABORTED_MARKER } from "../src/codex.ts";
-import { forkSide, hasStarted, SIDE_OPENING } from "../src/fork.ts";
+import { forkSide, hasStarted, SIDE_OPENING, sideOrigin } from "../src/fork.ts";
 
 /** A parent session with extension state between messages and a compaction that kept history from such state. */
 function parent() {
@@ -31,18 +31,21 @@ function parent() {
 	return session;
 }
 
+const sideHeader = { type: "session" as const, version: 3, id: "side-id", timestamp: "", cwd: "/project" };
+const fork = (session: SessionManager, midTurn = false) =>
+	forkSide(sideHeader, session.getBranch(), midTurn, { parentSessionId: session.getSessionId() });
+
 const llmView = (entries: SessionEntry[]) =>
 	buildSessionContext(entries).messages.map((message) => JSON.stringify(message));
 
 describe("forkSide", () => {
-	it("keeps the session id and everything the model sees, without extension state", () => {
+	it("has its own header and keeps everything the model sees, without extension state", () => {
 		const session = parent();
-		const [header, ...entries] = forkSide(session.getHeader()!, session.getBranch(), false) as [
-			{ id: string },
-			...SessionEntry[],
-		];
+		const [header, ...entries] = fork(session) as [{ id: string }, ...SessionEntry[]];
 
-		expect(header.id).toBe("parent-id");
+		expect(header.id).toBe("side-id");
+		expect(sideOrigin(entries)).toEqual({ parentSessionId: "parent-id" });
+		expect(sideOrigin(session.getBranch())).toBeUndefined();
 		expect(entries.some((entry) => entry.type === "custom")).toBe(false);
 		entries.forEach((entry, index) => expect(entry.parentId).toBe(entries[index - 1]?.id ?? null));
 		expect(llmView(entries).slice(0, -1)).toEqual(llmView(session.getBranch()));
@@ -50,7 +53,7 @@ describe("forkSide", () => {
 
 	it("keeps compacted history from the entry after a dropped one", () => {
 		const session = parent();
-		const entries = forkSide(session.getHeader()!, session.getBranch(), false).slice(1) as SessionEntry[];
+		const entries = fork(session).slice(1) as SessionEntry[];
 		const compaction = entries.find((entry) => entry.type === "compaction")!;
 		const kept = entries.find((entry) => entry.id === compaction.firstKeptEntryId);
 
@@ -61,7 +64,7 @@ describe("forkSide", () => {
 	it("ends with the hidden side instructions, after an interrupted marker when the parent is mid-turn", () => {
 		const session = parent();
 		const hidden = (midTurn: boolean) =>
-			(forkSide(session.getHeader()!, session.getBranch(), midTurn).slice(1) as SessionEntry[])
+			(fork(session, midTurn).slice(1) as SessionEntry[])
 				.filter((entry) => entry.type === "custom_message")
 				.map((entry) => entry.type === "custom_message" && !entry.display && entry.content);
 
