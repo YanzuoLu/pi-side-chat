@@ -129,6 +129,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 				open.length > 1 ? `${SWITCH_LABEL} to switch` : `${TOGGLE_LABEL} to switch`,
 				`${HANDOFF_LABEL} to hand off`,
 				`${CLOSE_LABEL} to close`,
+				// The id to resume the side conversation with later, in any window.
+				current.id,
 			);
 			text = `Side ${parts.join(" · ")}`;
 		} else if (!text) {
@@ -222,10 +224,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 					void close(current);
 				},
 			});
-			if (model) {
-				// The footer shows the session name, so the side's id is in view for resuming it later.
-				await current.process.setSessionName(`Side ${current.id}`);
-			} else {
+			if (!model) {
 				const state = await current.process.state();
 				current.model = { provider: state.model!.provider, id: state.model!.id, thinking: state.thinkingLevel };
 			}
@@ -391,12 +390,31 @@ export default function sideChat(pi: ExtensionAPI): void {
 			void close(current);
 			return { consume: true };
 		}
+		// Esc and the dequeue key belong to the side conversation here, never to the hidden parent.
 		if (matchesKey(data, "escape")) {
-			// Esc belongs to the side conversation here, never to the hidden parent.
-			current.process!.abort().catch(() => {});
+			restoreQueue(current, true).catch((error: Error) => notifyError(error.message));
+			return { consume: true };
+		}
+		if (current.view.matches(data, "app.message.dequeue")) {
+			restoreQueue(current, false).catch((error: Error) => notifyError(error.message));
 			return { consume: true };
 		}
 		return undefined;
+	};
+
+	/**
+	 * Puts the side's queued messages back in the editor, before what is typed there, as Pi does for
+	 * its own queue, and stops the side's turn if `abort`.
+	 */
+	const restoreQueue = async (current: Side, abort: boolean) => {
+		const child = current.process!;
+		const { steering, followUp } = await child.clearQueue();
+		const queued = [...steering, ...followUp];
+		if (queued.length > 0 && ctx && current.view.visible) {
+			const text = [queued.join("\n\n"), ctx.ui.getEditorText()].filter((part) => part.trim()).join("\n\n");
+			ctx.ui.setEditorText(text);
+		}
+		if (abort) await child.abort();
 	};
 
 	for (const name of COMMANDS) {

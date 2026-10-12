@@ -120,8 +120,9 @@ export class SideProcess {
 		await this.request({ type: "set_model", provider, modelId });
 	}
 
-	async setSessionName(name: string): Promise<void> {
-		await this.request({ type: "set_session_name", name });
+	/** Takes the queued steering and follow-up messages out of the side session and returns their text. */
+	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
+		return (await this.request({ type: "clear_queue" })) as { steering: string[]; followUp: string[] };
 	}
 
 	async setThinkingLevel(level: string): Promise<void> {

@@ -14,9 +14,9 @@ Codex's `/side` conversations for [Pi](https://pi.dev).
 | `shift + ←` / `shift + →` | Go through the main thread and every open side conversation in order |
 | `ctrl + s` | Hand off: close the side conversation shown after it writes a handoff, which is steered into the main thread |
 | `ctrl + c` on an empty editor | Close the side conversation shown and return to the main thread |
-| `esc` | Stop the side conversation's current turn |
+| `esc` | Stop the side conversation's current turn, putting its queued messages back in the editor as Pi does |
 
-Each `/side` opens another side conversation forked from the main thread, also when typed in a side conversation. Each runs as its own Pi process, so many open ones take memory. Once you ask something in it, it is saved as a session of its own next to the main thread's, named `Side <id>` after its session id, which the footer shows. Closing it shows the id again, and `pi --session <id>` resumes it in any window. A side conversation where you asked nothing is not kept.
+Each `/side` opens another side conversation forked from the main thread, also when typed in a side conversation. Each runs as its own Pi process, so many open ones take memory. Once you ask something in it, it is saved as a session of its own next to the main thread's, and the line above the editor ends with its session id. Closing it shows the id again, and `pi --session <id>` resumes it in any window. A side conversation where you asked nothing is not kept.
 
 Saved side conversations that are still open when you leave the main session, by quitting, `/reload`, `/new` or switching sessions, come back with it: they open again in the background, with their transcript, the next time the main session starts, and `shift + ←/→` or `ctrl + /` switches to them.
 

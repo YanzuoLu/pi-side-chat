@@ -46,11 +46,13 @@ type Interactive = {
 	session: object & { autoCompactionEnabled: boolean };
 	documentContainer: Container;
 	chatContainer: Container;
+	pendingMessagesContainer: Container;
 	statusContainer: Container;
 	footerContainer: Container;
 	footer: Component;
 	footerDataProvider: FooterData;
 	editor: Editor;
+	keybindings: { matches(data: string, action: string): boolean };
 	activeStatusIndicator?: Indicator;
 	handleEvent(event: unknown): Promise<void>;
 	showExtensionNotify(message: string, type?: "info" | "warning" | "error"): void;
@@ -76,6 +78,7 @@ const DRAWN_EVENTS = new Set([
 	"compaction_end",
 	"auto_retry_start",
 	"auto_retry_end",
+	"queue_update",
 ]);
 
 /** Events drawn from the side session's stored entries, which must include the new entry first. */
@@ -110,7 +113,10 @@ export function findInteractiveMode(ctx: ExtensionContext, statusKey: string): I
 		!(Stage.has(mode as Interactive) || mode.documentContainer?.children.includes(mode.chatContainer)) ||
 		!(mode.statusContainer instanceof Container) ||
 		!(mode.footerContainer instanceof Container) ||
+		!(mode.pendingMessagesContainer instanceof Container) ||
+		!writable("pendingMessagesContainer") ||
 		!writable("statusContainer") ||
+		typeof mode.keybindings?.matches !== "function" ||
 		!writable("footerContainer") ||
 		typeof mode.footer?.render !== "function" ||
 		typeof mode.footerDataProvider?.getExtensionStatuses !== "function" ||
@@ -136,7 +142,7 @@ class Slot {
 	/** From now on the parent draws into its own container, which this slot shows until told otherwise. */
 	constructor(
 		private readonly mode: Interactive,
-		private readonly key: "statusContainer" | "footerContainer",
+		private readonly key: "pendingMessagesContainer" | "statusContainer" | "footerContainer",
 	) {
 		this.layout = mode[key];
 		this.parent.children = this.layout.children;
@@ -188,7 +194,11 @@ class Stage {
 			this.parentIndicator = indicator;
 			return this.current ? this.embedsIndicator() : setIndicator.call(mode, indicator);
 		};
-		this.slots = [new Slot(mode, "statusContainer"), new Slot(mode, "footerContainer")];
+		this.slots = [
+			new Slot(mode, "pendingMessagesContainer"),
+			new Slot(mode, "statusContainer"),
+			new Slot(mode, "footerContainer"),
+		];
 	}
 
 	add(view: SideView): void {
@@ -207,8 +217,9 @@ class Stage {
 		}
 		this.swapChat(this.current?.chat ?? this.mode.chatContainer, view.chat);
 		this.current = view;
-		this.slots[0]!.show(view.status);
-		this.slots[1]!.show(view.footer);
+		this.slots[0]!.show(view.pending);
+		this.slots[1]!.show(view.status);
+		this.slots[2]!.show(view.footer);
 		setIndicator.call(this.mode, view.indicator);
 		editor.setText(view.draft);
 		editor.onSubmit = (text) => {
@@ -267,6 +278,9 @@ class Stage {
 export class SideView {
 	readonly chat = new Container();
 	readonly status = new Container();
+	/** The side's queued steering and follow-up messages, drawn above its editor like the parent's. */
+	readonly pending = new Container();
+	queue: { steering: string[]; followUp: string[] } = { steering: [], followUp: [] };
 	readonly footer: Component;
 	/** The side's working indicator, and its editor draft while it is not shown. */
 	indicator: Indicator | undefined;
@@ -312,14 +326,15 @@ export class SideView {
 			autoCompactionEnabled: { get: () => view.state.autoCompactionEnabled },
 			retryAttempt: { get: () => view.retryAttempt },
 			getContextUsage: own((): ContextUsage | undefined => view.state.contextUsage),
-			getSteeringMessages: own(() => []),
-			getFollowUpMessages: own(() => []),
+			getSteeringMessages: own(() => view.queue.steering),
+			getFollowUpMessages: own(() => view.queue.followUp),
 		});
 		this.renderer = Object.create(mode, {
 			session: own(session),
 			sessionManager: { get: () => view.session },
 			chatContainer: own(this.chat),
 			statusContainer: own(this.status),
+			pendingMessagesContainer: own(this.pending),
 			pendingTools: own(new Map()),
 			streamingComponent: own(undefined),
 			streamingMessage: own(undefined),
@@ -341,7 +356,6 @@ export class SideView {
 			settingsManager: own(Object.create((mode as unknown as { settingsManager: object }).settingsManager, {
 				getShowTerminalProgress: own(() => false),
 			})),
-			updatePendingMessagesDisplay: own(() => {}),
 		}) as Interactive;
 
 		const FooterComponent = mode.footer.constructor as new (session: unknown, data: FooterData) => Component & {
@@ -368,6 +382,11 @@ export class SideView {
 		return this.stage.current === this;
 	}
 
+	/** Whether `data` is a key bound to one of Pi's actions, such as `app.message.dequeue`. */
+	matches(data: string, action: string): boolean {
+		return this.mode.keybindings.matches(data, action);
+	}
+
 	/** Whether the editor has focus without a popup, so keys reach the conversation rather than a dialog. */
 	get editorFocused(): boolean {
 		return this.mode.ui.focusedComponent === this.mode.editor && !this.mode.editor.isShowingAutocomplete?.();
@@ -382,6 +401,7 @@ export class SideView {
 			if (this.disposed) return;
 			// Pi persists a message after drawing it, and compares it against the entries before it.
 			const until = event.type === "message_end" ? (event.message as { timestamp: number }).timestamp : undefined;
+			if (event.type === "queue_update") this.queue = { steering: event.steering as string[], followUp: event.followUp as string[] };
 			if (DRAWN_FROM_ENTRIES.has(event.type)) await this.sync();
 			if (DRAWN_EVENTS.has(event.type)) await this.renderer.handleEvent(drawn);
 			if (event.type === "auto_retry_end" || event.type === "agent_end") this.retryAttempt = 0;
