@@ -24,7 +24,7 @@ import {
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
-import { type SideEvent, SideProcess, type SideProcessOptions } from "./child.ts";
+import { type SideEvent, SideProcess, type SideProcessOptions, type SideState } from "./child.ts";
 import {
 	SIDE_NO_STARTED_CONVERSATION_MESSAGE,
 	SIDE_SLASH_COMMAND_UNAVAILABLE_HINT,
@@ -59,8 +59,6 @@ type Side = {
 	/** Commands the side session runs itself, such as extension commands, prompt templates and skills. */
 	commands: Set<string>;
 	streaming: boolean;
-	/** The model and thinking level the side conversation runs with. */
-	model: { provider: string; id: string; thinking: string };
 	/** When the side conversation was forked from the main thread. */
 	forkedAt: string;
 	/** Whether the user has said anything in the side conversation. */
@@ -76,7 +74,6 @@ function newSide(
 	view: SideView,
 	sessionFile: string,
 	sessionDir: string,
-	model: Side["model"],
 	temporary?: string,
 ): Side {
 	return {
@@ -87,7 +84,6 @@ function newSide(
 		temporary,
 		commands: new Set(),
 		streaming: false,
-		model,
 		forkedAt: header.timestamp,
 		asked: false,
 		handingOff: false,
@@ -182,16 +178,36 @@ export default function sideChat(pi: ExtensionAPI): void {
 			notifyError(`'/${command}' is unavailable in side conversations. ${SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}`);
 			return;
 		}
+		// `!command` runs in the side's shell like Pi's, `!!command` keeps its output out of the model's context.
+		if (text.startsWith("!")) {
+			const excluded = text.startsWith("!!");
+			const bash = text.slice(excluded ? 2 : 1).trim();
+			if (bash) {
+				if (current.view.runningBash) {
+					current.view.notify("A bash command is already running. Press Esc to cancel it first.", "warning");
+					ctx.ui.setEditorText(text);
+					return;
+				}
+				markAsked(current);
+				current.view.runBash(bash, excluded).catch((error: Error) => notifyError(error.message));
+				return;
+			}
+		}
+		if (!current.streaming) current.view.flushBash();
 		current.process?.prompt(text, current.streaming).catch((error: Error) => notifyError(error.message));
+	};
+
+	/** Keeps a side conversation once the user has done something in it. */
+	const markAsked = (current: Side) => {
+		if (current.asked) return;
+		current.asked = true;
+		if (!current.temporary) remember();
 	};
 
 	const handleEvent = (current: Side, event: SideEvent) => {
 		if (event.type === "agent_start") current.streaming = true;
 		if (event.type === "agent_end") current.streaming = false;
-		if (event.type === "message_start" && (event.message as { role?: string }).role === "user" && !current.asked) {
-			current.asked = true;
-			if (!current.temporary) remember();
-		}
+		if (event.type === "message_start" && (event.message as { role?: string }).role === "user") markAsked(current);
 		current.view.draw(event);
 	};
 
@@ -224,10 +240,6 @@ export default function sideChat(pi: ExtensionAPI): void {
 					void close(current);
 				},
 			});
-			if (!model) {
-				const state = await current.process.state();
-				current.model = { provider: state.model!.provider, id: state.model!.id, thinking: state.thinkingLevel };
-			}
 			for (const info of await current.process.commands()) {
 				if (!COMMANDS.includes(info)) current.commands.add(info);
 			}
@@ -241,7 +253,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 			await current.process.close();
 			return false;
 		}
-		view.attach(current.process);
+		view.attach(current.process, [...current.commands, ...COMMANDS]);
 		if (model) show(current);
 		else updateLabel();
 		if (message) submit(current, message);
@@ -277,7 +289,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 		const view = new SideView(findInteractiveMode(context, KEY), entries, { model, thinkingLevel: thinking });
 		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 		const sideModel = { provider: model.provider, id: model.id, thinking };
-		await launch(context, newSide(sideHeader, view, sessionFile, sessionDir, sideModel, temporary), sideModel, message);
+		await launch(context, newSide(sideHeader, view, sessionFile, sessionDir, temporary), sideModel, message);
 	};
 
 	/** Opens a side conversation saved by this session again, without showing it. */
@@ -292,11 +304,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 			model,
 			thinkingLevel: pi.getThinkingLevel(),
 		});
-		const current = newSide(header, view, sessionFile, dirname(sessionFile), {
-			provider: model.provider,
-			id: model.id,
-			thinking: pi.getThinkingLevel(),
-		});
+		const current = newSide(header, view, sessionFile, dirname(sessionFile));
 		current.asked = true;
 		view.replay();
 		await launch(context, current, undefined);
@@ -328,14 +336,15 @@ export default function sideChat(pi: ExtensionAPI): void {
 		if (!current.asked) return close(current);
 		current.handingOff = true;
 		hide(current);
-		let switched = false;
+		/** The side's own model and thinking level, while the handoff is written with others. */
+		let own: SideState | undefined;
 		try {
 			if (current.streaming) await child.abort();
 			const config = readHandoffConfig(join(getAgentDir(), CONFIG_FILE));
 			if (config.model || config.thinking) {
-				switched = true;
+				own = await child.state();
 				if (config.model) await child.setModel(config.model.provider, config.model.id);
-				await child.setThinkingLevel(config.thinking ?? current.model.thinking);
+				await child.setThinkingLevel(config.thinking ?? own.thinkingLevel);
 			}
 			const handoff = await child.reply(HANDOFF_PROMPT);
 			if (!sides.includes(current)) return;
@@ -349,9 +358,9 @@ export default function sideChat(pi: ExtensionAPI): void {
 			current.handingOff = false;
 			updateLabel();
 			notifyError(`Failed to hand off side conversation: ${(error as Error).message}`);
-			if (switched) {
-				await child.setModel(current.model.provider, current.model.id).catch(() => {});
-				await child.setThinkingLevel(current.model.thinking).catch(() => {});
+			if (own?.model) {
+				await child.setModel(own.model.provider, own.model.id).catch(() => {});
+				await child.setThinkingLevel(own.thinkingLevel).catch(() => {});
 			}
 		}
 	};
@@ -390,9 +399,24 @@ export default function sideChat(pi: ExtensionAPI): void {
 			void close(current);
 			return { consume: true };
 		}
-		// Esc and the dequeue key belong to the side conversation here, never to the hidden parent.
+		// Pi's keys for the conversation shown act on the side conversation here, never on the hidden parent.
+		const report = (error: Error) => notifyError(error.message);
 		if (matchesKey(data, "escape")) {
-			restoreQueue(current, true).catch((error: Error) => notifyError(error.message));
+			if (!current.streaming && current.view.runningBash) current.process!.abortBash().catch(report);
+			else restoreQueue(current, true).catch(report);
+			return { consume: true };
+		}
+		if (current.view.matches(data, "app.thinking.cycle")) {
+			current.view.cycleThinkingLevel().catch(report);
+			return { consume: true };
+		}
+		if (current.view.matches(data, "app.model.cycleForward") || current.view.matches(data, "app.model.cycleBackward")) {
+			const direction = current.view.matches(data, "app.model.cycleForward") ? "forward" : "backward";
+			current.view.cycleModel(direction).catch(report);
+			return { consume: true };
+		}
+		if (current.view.matches(data, "app.model.select")) {
+			current.view.selectModel();
 			return { consume: true };
 		}
 		if (current.view.matches(data, "app.message.dequeue")) {

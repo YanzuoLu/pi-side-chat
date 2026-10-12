@@ -16,12 +16,14 @@ import {
 	type SessionHeader,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
-import { type Component, Container } from "@earendil-works/pi-tui";
+import type { Model } from "@earendil-works/pi-ai";
+import { type AutocompleteProvider, type Component, Container } from "@earendil-works/pi-tui";
 import type { SideEvent, SideState } from "./child.ts";
 import { SIDE_MESSAGE_TYPE } from "./fork.ts";
 import { StreamingMessage } from "./stream.ts";
 
 type Editor = Component & {
+	setAutocompleteProvider?: (provider: AutocompleteProvider) => void;
 	onSubmit?: (text: string) => void | Promise<void>;
 	addToHistory?: (text: string) => void;
 	isShowingAutocomplete?: () => boolean;
@@ -53,14 +55,45 @@ type Interactive = {
 	footerDataProvider: FooterData;
 	editor: Editor;
 	keybindings: { matches(data: string, action: string): boolean };
+	autocompleteProvider?: AutocompleteProvider;
+	settingsManager: { setDefaultModelAndProvider(provider: string, modelId: string): void };
 	activeStatusIndicator?: Indicator;
 	handleEvent(event: unknown): Promise<void>;
 	showExtensionNotify(message: string, type?: "info" | "warning" | "error"): void;
 	renderSessionEntries(entries: SessionEntry[]): void;
 	setEditorWorkingStatusIndicator(indicator: Indicator | undefined): boolean;
+	updateEditorBorderColor(): void;
+	showStatus(message: string): void;
+	cycleModel(direction: "forward" | "backward"): Promise<void>;
+	showModelSelector(initialSearchInput?: string): void;
+	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
+	flushPendingBashComponents(): void;
 };
 
+/** What a side view asks of the side session it shows. */
+export interface SideSource {
+	entries(since: string): Promise<SessionEntry[]>;
+	state(): Promise<SideState>;
+	setModel(provider: string, modelId: string): Promise<void>;
+	setThinkingLevel(level: string): Promise<void>;
+	cycleThinkingLevel(): Promise<string | undefined>;
+	bash(command: string, excludeFromContext: boolean, onOutput: (delta: string) => void): Promise<BashResult>;
+	abortBash(): Promise<void>;
+}
+
+export interface BashResult {
+	output: string;
+	exitCode: number | undefined;
+	cancelled: boolean;
+	truncated: boolean;
+	fullOutputPath?: string;
+}
+
+type ScopedModel = { model: Model<any>; thinkingLevel?: string };
+
 type SetIndicator = Interactive["setEditorWorkingStatusIndicator"];
+
+const prototype = InteractiveMode.prototype as unknown as Interactive;
 
 /** Session events that Pi's interactive mode draws for the side conversation. */
 const DRAWN_EVENTS = new Set([
@@ -87,8 +120,7 @@ const DRAWN_FROM_ENTRIES = new Set(["entry_appended", "compaction_end"]);
 /** Events after which the side session has stored new entries or changed what the footer shows. */
 const CHANGING_EVENTS = new Set(["message_end", "agent_end", "compaction_end", "entry_appended"]);
 
-const setIndicator = (InteractiveMode.prototype as unknown as { setEditorWorkingStatusIndicator: SetIndicator })
-	.setEditorWorkingStatusIndicator;
+const setIndicator: SetIndicator = prototype.setEditorWorkingStatusIndicator;
 
 /** Finds Pi's interactive mode behind `ctx.ui`, which forwards status updates to it. */
 export function findInteractiveMode(ctx: ExtensionContext, statusKey: string): Interactive {
@@ -117,6 +149,10 @@ export function findInteractiveMode(ctx: ExtensionContext, statusKey: string): I
 		!writable("pendingMessagesContainer") ||
 		!writable("statusContainer") ||
 		typeof mode.keybindings?.matches !== "function" ||
+		typeof mode.settingsManager?.setDefaultModelAndProvider !== "function" ||
+		typeof mode.editor?.setAutocompleteProvider !== "function" ||
+		!["updateEditorBorderColor", "showStatus", "cycleModel", "showModelSelector", "handleBashCommand", "flushPendingBashComponents"]
+			.every((method) => typeof (prototype as unknown as Record<string, unknown>)[method] === "function") ||
 		!writable("footerContainer") ||
 		typeof mode.footer?.render !== "function" ||
 		typeof mode.footerDataProvider?.getExtensionStatuses !== "function" ||
@@ -194,6 +230,11 @@ class Stage {
 			this.parentIndicator = indicator;
 			return this.current ? this.embedsIndicator() : setIndicator.call(mode, indicator);
 		};
+		// The editor's border shows the thinking level of the conversation shown, whoever asks to redraw it.
+		(mode as unknown as Record<string, unknown>).updateEditorBorderColor = () => {
+			if (this.current) this.current.updateBorder();
+			else prototype.updateEditorBorderColor.call(mode);
+		};
 		this.slots = [
 			new Slot(mode, "pendingMessagesContainer"),
 			new Slot(mode, "statusContainer"),
@@ -222,6 +263,8 @@ class Stage {
 		this.slots[2]!.show(view.footer);
 		setIndicator.call(this.mode, view.indicator);
 		editor.setText(view.draft);
+		if (this.mode.autocompleteProvider) editor.setAutocompleteProvider!(view.autocomplete(this.mode.autocompleteProvider));
+		view.updateBorder();
 		editor.onSubmit = (text) => {
 			if (text.trim()) editor.addToHistory?.(text.trim());
 			submit(text);
@@ -241,6 +284,8 @@ class Stage {
 		setIndicator.call(this.mode, this.parentIndicator);
 		editor.setText(this.parentDraft);
 		editor.onSubmit = this.parentSubmit;
+		if (this.mode.autocompleteProvider) editor.setAutocompleteProvider!(this.mode.autocompleteProvider);
+		prototype.updateEditorBorderColor.call(this.mode);
 		this.mode.ui.requestRender(true);
 	}
 
@@ -251,6 +296,7 @@ class Stage {
 		if (this.views.size > 0) return;
 		for (const slot of this.slots) slot.restore();
 		delete (this.mode as unknown as Record<string, unknown>).setEditorWorkingStatusIndicator;
+		delete (this.mode as unknown as Record<string, unknown>).updateEditorBorderColor;
 		Stage.stages.delete(this.mode);
 		this.mode.ui.requestRender(true);
 	}
@@ -294,7 +340,11 @@ export class SideView {
 	private session: SessionManager;
 	private state: SideState;
 	private retryAttempt = 0;
-	private source: { entries(since: string): Promise<SessionEntry[]>; state(): Promise<SideState> } | undefined;
+	private streaming = false;
+	private bashRunning = false;
+	/** The slash commands the side runs, which its editor completes. */
+	private commandNames = new Set<string>();
+	private source: SideSource | undefined;
 	private drawing = Promise.resolve();
 	private disposed = false;
 
@@ -328,6 +378,26 @@ export class SideView {
 			getContextUsage: own((): ContextUsage | undefined => view.state.contextUsage),
 			getSteeringMessages: own(() => view.queue.steering),
 			getFollowUpMessages: own(() => view.queue.followUp),
+			isStreaming: { get: () => view.streaming },
+			isBashRunning: { get: () => view.bashRunning },
+			// The side process runs its own extensions' user_bash handlers.
+			extensionRunner: own(Object.create((mode.session as unknown as { extensionRunner: object }).extensionRunner, {
+				emitUserBash: own(async () => undefined),
+			})),
+			executeBash: own(async (command: string, onChunk: (delta: string) => void, options?: { excludeFromContext?: boolean }) => {
+				view.bashRunning = true;
+				try {
+					return await view.source!.bash(command, options?.excludeFromContext ?? false, onChunk);
+				} finally {
+					view.bashRunning = false;
+				}
+			}),
+			setModel: own(async (model: Model<any>, options: { persist?: boolean } = {}) => {
+				await view.source!.setModel(model.provider, model.id);
+				if (options.persist) mode.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+				await view.refreshState();
+			}),
+			cycleModel: own((direction: "forward" | "backward") => view.nextModel(direction)),
 		});
 		this.renderer = Object.create(mode, {
 			session: own(session),
@@ -336,6 +406,12 @@ export class SideView {
 			statusContainer: own(this.status),
 			pendingMessagesContainer: own(this.pending),
 			pendingTools: own(new Map()),
+			pendingBashComponents: own([]),
+			bashComponent: own(undefined),
+			// Only the conversation shown colors the editor's border.
+			updateEditorBorderColor: own(() => {
+				if (view.visible) prototype.updateEditorBorderColor.call(view.renderer);
+			}),
 			streamingComponent: own(undefined),
 			streamingMessage: own(undefined),
 			activeStatusIndicator: own(undefined),
@@ -372,9 +448,10 @@ export class SideView {
 		this.stage.add(this);
 	}
 
-	/** Connects the view to the side session it shows. */
-	attach(source: { entries(since: string): Promise<SessionEntry[]>; state(): Promise<SideState> }): void {
+	/** Connects the view to the side session it shows, whose editor completes `commands`. */
+	attach(source: SideSource, commands: Iterable<string>): void {
 		this.source = source;
+		this.commandNames = new Set(commands);
 		this.drawing = this.drawing.then(() => this.sync());
 	}
 
@@ -395,6 +472,12 @@ export class SideView {
 	/** Draws one event from the side session, in order. */
 	draw(event: SideEvent): void {
 		if (event.type === "auto_retry_start") this.retryAttempt = event.attempt as number;
+		if (event.type === "agent_start") this.streaming = true;
+		if (event.type === "agent_end") this.streaming = false;
+		if (event.type === "thinking_level_changed") {
+			this.state = { ...this.state, thinkingLevel: event.level as string };
+			this.updateBorder();
+		}
 		if (!DRAWN_EVENTS.has(event.type) && !CHANGING_EVENTS.has(event.type)) return;
 		const drawn = this.message.track(event);
 		this.drawing = this.drawing.then(async () => {
@@ -407,6 +490,94 @@ export class SideView {
 			if (event.type === "auto_retry_end" || event.type === "agent_end") this.retryAttempt = 0;
 			if (CHANGING_EVENTS.has(event.type) && !DRAWN_FROM_ENTRIES.has(event.type)) await this.sync(until);
 		});
+	}
+
+	/** Whether a `!` command of the side's is running. */
+	get runningBash(): boolean {
+		return this.bashRunning;
+	}
+
+	/** Colors the editor's border for the side's thinking level, or for bash mode, while it is shown. */
+	updateBorder(): void {
+		this.renderer.updateEditorBorderColor();
+	}
+
+	/** The editor's completion for the side: `base`, with only the slash commands the side runs. */
+	autocomplete(base: AutocompleteProvider): AutocompleteProvider {
+		return {
+			triggerCharacters: base.triggerCharacters,
+			shouldTriggerFileCompletion: base.shouldTriggerFileCompletion?.bind(base),
+			applyCompletion: (...args) => base.applyCompletion(...args),
+			getSuggestions: async (lines, cursorLine, cursorCol, options) => {
+				const suggestions = await base.getSuggestions(lines, cursorLine, cursorCol, options);
+				const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
+				if (!suggestions || !before.startsWith("/") || before.includes(" ")) return suggestions;
+				const items = suggestions.items.filter((item) => this.commandNames.has(item.value));
+				return items.length > 0 ? { ...suggestions, items } : null;
+			},
+		};
+	}
+
+	/** Pi's Shift+Tab for the side: the next thinking level, reported in its transcript. */
+	async cycleThinkingLevel(): Promise<void> {
+		const level = await this.source!.cycleThinkingLevel();
+		if (level === undefined) {
+			this.renderer.showStatus("Current model does not support thinking");
+			return;
+		}
+		this.state = { ...this.state, thinkingLevel: level };
+		this.updateBorder();
+		this.renderer.showStatus(`Thinking level: ${level}`);
+	}
+
+	/** Pi's model cycling keys for the side. */
+	cycleModel(direction: "forward" | "backward"): Promise<void> {
+		return this.renderer.cycleModel(direction);
+	}
+
+	/** Pi's model selector for the side. */
+	selectModel(): void {
+		this.renderer.showModelSelector();
+	}
+
+	/** Runs a `!` command in the side session and draws it as Pi does. */
+	runBash(command: string, excludeFromContext: boolean): Promise<void> {
+		return this.renderer.handleBashCommand(command, excludeFromContext);
+	}
+
+	/** Moves `!` commands run while the side was working into its transcript, as Pi does before a new prompt. */
+	flushBash(): void {
+		this.renderer.flushPendingBashComponents();
+	}
+
+	/**
+	 * Switches the side to the next or previous model the way Pi's cycling does: through the scoped
+	 * models with their thinking levels if there are any, otherwise through every available model.
+	 */
+	private async nextModel(direction: "forward" | "backward") {
+		const session = this.mode.session as unknown as {
+			scopedModels: ScopedModel[];
+			modelRuntime: { getAvailableSnapshot(): Model<any>[] };
+		};
+		const available = session.modelRuntime.getAvailableSnapshot();
+		const ids = new Set(available.map((model) => `${model.provider}\0${model.id}`));
+		const scoped = session.scopedModels.length > 0;
+		const candidates: ScopedModel[] = scoped
+			? session.scopedModels.filter((entry) => ids.has(`${entry.model.provider}\0${entry.model.id}`))
+			: available.map((model) => ({ model }));
+		if (candidates.length <= 1) return undefined;
+		const current = this.state.model;
+		const index = Math.max(0, candidates.findIndex((entry) => entry.model.provider === current?.provider && entry.model.id === current?.id));
+		const next = candidates[(index + (direction === "forward" ? 1 : -1) + candidates.length) % candidates.length]!;
+		await this.source!.setModel(next.model.provider, next.model.id);
+		if (next.thinkingLevel) await this.source!.setThinkingLevel(next.thinkingLevel);
+		await this.refreshState();
+		return { model: next.model, thinkingLevel: this.state.thinkingLevel, isScoped: scoped };
+	}
+
+	private async refreshState(): Promise<void> {
+		this.state = await this.source!.state();
+		this.mode.ui.requestRender();
 	}
 
 	/** Draws what the side conversation already holds after its opening, as for one opened again. */

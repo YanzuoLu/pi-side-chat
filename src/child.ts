@@ -2,6 +2,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import type { Model } from "@earendil-works/pi-ai";
 import { type ContextUsage, type ExtensionUIContext, parseArgs, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { BashResult, SideSource } from "./view.ts";
 
 /** A session event from the side process, as Pi's RPC mode prints it. */
 export type SideEvent = { type: string; [key: string]: unknown };
@@ -42,7 +43,7 @@ type Response = { id?: string; success: boolean; data?: unknown; error?: string 
  * loads or runs touches the parent's module state, and closing it ends whatever it started. It runs
  * the same Pi as this process, with the same extensions and settings, outside herdr.
  */
-export class SideProcess {
+export class SideProcess implements SideSource {
 	private readonly child: ChildProcessWithoutNullStreams;
 	private readonly pending = new Map<string, (response: Response) => void>();
 	private nextId = 0;
@@ -120,6 +121,30 @@ export class SideProcess {
 		await this.request({ type: "set_model", provider, modelId });
 	}
 
+	/** The next thinking level, or undefined if the model does not think. */
+	async cycleThinkingLevel(): Promise<string | undefined> {
+		const data = (await this.request({ type: "cycle_thinking_level" })) as { level: string } | null;
+		return data?.level;
+	}
+
+	/** Runs a `!` command in the side session, streaming its output to `onOutput`. */
+	async bash(command: string, excludeFromContext: boolean, onOutput: (delta: string) => void): Promise<BashResult> {
+		const id = `side-${++this.nextId}`;
+		const watcher = (event: SideEvent | undefined) => {
+			if (event?.type === "bash_execution_update" && event.id === id) onOutput(event.delta as string);
+		};
+		this.watchers.add(watcher);
+		try {
+			return (await this.request({ type: "bash", command, excludeFromContext }, id)) as BashResult;
+		} finally {
+			this.watchers.delete(watcher);
+		}
+	}
+
+	async abortBash(): Promise<void> {
+		await this.request({ type: "abort_bash" });
+	}
+
 	/** Takes the queued steering and follow-up messages out of the side session and returns their text. */
 	async clearQueue(): Promise<{ steering: string[]; followUp: string[] }> {
 		return (await this.request({ type: "clear_queue" })) as { steering: string[]; followUp: string[] };
@@ -183,8 +208,7 @@ export class SideProcess {
 		clearTimeout(killer);
 	}
 
-	private async request(command: Record<string, unknown>): Promise<unknown> {
-		const id = `side-${++this.nextId}`;
+	private async request(command: Record<string, unknown>, id = `side-${++this.nextId}`): Promise<unknown> {
 		const response = await new Promise<Response>((resolve) => {
 			this.pending.set(id, resolve);
 			this.send({ ...command, id });
