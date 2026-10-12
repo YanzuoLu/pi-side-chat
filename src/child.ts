@@ -10,9 +10,8 @@ export interface SideProcessOptions {
 	cwd: string;
 	sessionFile: string;
 	sessionDir: string;
-	provider: string;
-	model: string;
-	thinking: string;
+	/** The model and thinking level to start with, or the session's own when resuming one. */
+	model?: { provider: string; id: string; thinking: string };
 	/** Where the side's extension dialogs show up. */
 	ui: () => ExtensionUIContext;
 	/** Shows a notification from the side's extensions. */
@@ -61,9 +60,9 @@ export class SideProcess {
 			"--mode", "rpc",
 			"--session", options.sessionFile,
 			"--session-dir", options.sessionDir,
-			"--provider", options.provider,
-			"--model", options.model,
-			"--thinking", options.thinking,
+			...(options.model
+				? ["--provider", options.model.provider, "--model", options.model.id, "--thinking", options.model.thinking]
+				: []),
 			...inheritedArgs(process.argv.slice(2)),
 		];
 		this.child = spawn(process.execPath, args, { cwd: options.cwd, env, stdio: ["pipe", "pipe", "pipe"] });

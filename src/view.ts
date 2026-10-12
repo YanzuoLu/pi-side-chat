@@ -18,6 +18,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type Component, Container } from "@earendil-works/pi-tui";
 import type { SideEvent, SideState } from "./child.ts";
+import { SIDE_MESSAGE_TYPE } from "./fork.ts";
 import { StreamingMessage } from "./stream.ts";
 
 type Editor = Component & {
@@ -53,6 +54,7 @@ type Interactive = {
 	activeStatusIndicator?: Indicator;
 	handleEvent(event: unknown): Promise<void>;
 	showExtensionNotify(message: string, type?: "info" | "warning" | "error"): void;
+	renderSessionEntries(entries: SessionEntry[]): void;
 	setEditorWorkingStatusIndicator(indicator: Indicator | undefined): boolean;
 };
 
@@ -114,6 +116,7 @@ export function findInteractiveMode(ctx: ExtensionContext, statusKey: string): I
 		typeof mode.footerDataProvider?.getExtensionStatuses !== "function" ||
 		typeof mode.handleEvent !== "function" ||
 		typeof mode.showExtensionNotify !== "function" ||
+		typeof mode.renderSessionEntries !== "function" ||
 		typeof setIndicator !== "function" ||
 		typeof mode.editor?.getText !== "function" ||
 		typeof mode.editor.setText !== "function" ||
@@ -384,6 +387,14 @@ export class SideView {
 			if (event.type === "auto_retry_end" || event.type === "agent_end") this.retryAttempt = 0;
 			if (CHANGING_EVENTS.has(event.type) && !DRAWN_FROM_ENTRIES.has(event.type)) await this.sync(until);
 		});
+	}
+
+	/** Draws what the side conversation already holds after its opening, as for one opened again. */
+	replay(): void {
+		const branch = this.session.getBranch();
+		const opening = branch.findLastIndex((entry) => entry.type === "custom_message" && entry.customType === SIDE_MESSAGE_TYPE);
+		const entries = branch.slice(opening + 1);
+		this.drawing = this.drawing.then(() => this.renderer.renderSessionEntries(entries));
 	}
 
 	/** Shows a notification in the side transcript, after the events drawn so far. */

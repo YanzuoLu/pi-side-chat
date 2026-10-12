@@ -8,20 +8,23 @@
  * side conversation shown last, Shift+Left and Shift+Right through all of them, without closing any.
  * Ctrl+C on an empty editor closes the side conversation shown. Ctrl+S closes it too, after it writes a handoff of what happened
  * in it, which is steered into the main thread. A side conversation the user asked something in is
- * saved as a session of its own, which `pi --session <id>` resumes like any other.
+ * saved as a session of its own, which `pi --session <id>` resumes like any other. Saved side
+ * conversations still open when the main session is left come back with it.
  */
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
 	type AgentEndEvent,
 	type ExtensionAPI,
 	type ExtensionContext,
+	type FileEntry,
 	getAgentDir,
+	type SessionHeader,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
-import { type SideEvent, SideProcess } from "./child.ts";
+import { type SideEvent, SideProcess, type SideProcessOptions } from "./child.ts";
 import {
 	SIDE_NO_STARTED_CONVERSATION_MESSAGE,
 	SIDE_SLASH_COMMAND_UNAVAILABLE_HINT,
@@ -39,6 +42,10 @@ const HANDOFF_LABEL = "ctrl + s";
 const HANDING_OFF_LABEL = "Side summarizing...";
 const CONFIG_FILE = "pi-side-chat.json";
 const COMMANDS = ["side", "btw"];
+/** Custom entry type in the main session that lists its open, saved side conversations. */
+const OPEN_SIDES_TYPE = "side-chat-open";
+
+type OpenSides = { sessionFiles: string[] };
 
 type Side = {
 	id: string;
@@ -64,6 +71,29 @@ type Side = {
 	parentStatus?: string;
 };
 
+function newSide(
+	header: SessionHeader,
+	view: SideView,
+	sessionFile: string,
+	sessionDir: string,
+	model: Side["model"],
+	temporary?: string,
+): Side {
+	return {
+		id: header.id,
+		view,
+		sessionFile,
+		sessionDir,
+		temporary,
+		commands: new Set(),
+		streaming: false,
+		model,
+		forkedAt: header.timestamp,
+		asked: false,
+		handingOff: false,
+	};
+}
+
 export default function sideChat(pi: ExtensionAPI): void {
 	let ctx: ExtensionContext | undefined;
 	/** The open side conversations, oldest first. */
@@ -71,6 +101,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 	/** The side conversation shown last, which Ctrl+/ returns to. */
 	let last: Side | undefined;
 	let stopKeys: (() => void) | undefined;
+	/** Whether this session is being left, which keeps its record of open side conversations as it is. */
+	let leaving = false;
 
 	const shown = () => sides.find((side) => side.view.visible);
 	/** The side conversations one can switch to: those running and not writing a handoff. */
@@ -125,12 +157,13 @@ export default function sideChat(pi: ExtensionAPI): void {
 		if (index < 0) return;
 		sides.splice(index, 1);
 		if (last === current) last = undefined;
+		if (current.asked && !current.temporary && !leaving) remember();
 		current.view.dispose();
 		updateLabel();
 		await current.process?.close();
 		if (current.temporary) rmSync(current.temporary, { recursive: true, force: true });
 		else if (!current.asked) rmSync(current.sessionFile, { force: true });
-		else ctx?.ui.notify(`Side conversation saved. Resume it with: pi --session ${current.id}`, "info");
+		else if (!leaving) ctx?.ui.notify(`Side conversation saved. Resume it with: pi --session ${current.id}`, "info");
 	};
 
 	const submit = (current: Side, text: string) => {
@@ -153,8 +186,67 @@ export default function sideChat(pi: ExtensionAPI): void {
 	const handleEvent = (current: Side, event: SideEvent) => {
 		if (event.type === "agent_start") current.streaming = true;
 		if (event.type === "agent_end") current.streaming = false;
-		if (event.type === "message_start" && (event.message as { role?: string }).role === "user") current.asked = true;
+		if (event.type === "message_start" && (event.message as { role?: string }).role === "user" && !current.asked) {
+			current.asked = true;
+			if (!current.temporary) remember();
+		}
 		current.view.draw(event);
+	};
+
+	/**
+	 * Starts the process of `current` and adds it to the open side conversations. A new one shows
+	 * right away and asks `message` if given; a reattached one waits to be switched to.
+	 */
+	const launch = async (
+		context: ExtensionContext,
+		current: Side,
+		model: SideProcessOptions["model"],
+		message?: string,
+	): Promise<boolean> => {
+		sides.push(current);
+		if (model) updateLabel(SIDE_STARTING_CONTEXT_LABEL);
+		const view = current.view;
+		try {
+			current.process = await SideProcess.start({
+				cwd: context.cwd,
+				sessionFile: current.sessionFile,
+				sessionDir: current.sessionDir,
+				model,
+				ui: () => context.ui,
+				notify: (text, type) => view.notify(text, type),
+				setStatus: (key, text) => view.setStatus(key, text),
+				onEvent: (event) => handleEvent(current, event),
+				onExit: (reason) => {
+					if (!sides.includes(current)) return;
+					notifyError(`Side conversation ended: ${reason}`);
+					void close(current);
+				},
+			});
+			if (model) {
+				// The footer shows the session name, so the side's id is in view for resuming it later.
+				await current.process.setSessionName(`Side ${current.id}`);
+			} else {
+				const state = await current.process.state();
+				current.model = { provider: state.model!.provider, id: state.model!.id, thinking: state.thinkingLevel };
+			}
+			for (const info of await current.process.commands()) {
+				if (!COMMANDS.includes(info)) current.commands.add(info);
+			}
+		} catch (error) {
+			await close(current);
+			notifyError(`Failed to start side conversation: ${(error as Error).message}`);
+			if (message) context.ui.setEditorText(message);
+			return false;
+		}
+		if (!sides.includes(current)) {
+			await current.process.close();
+			return false;
+		}
+		view.attach(current.process);
+		if (model) show(current);
+		else updateLabel();
+		if (message) submit(current, message);
+		return true;
 	};
 
 	/** Opens a new side conversation forked from the main thread, and asks `message` there if given. */
@@ -180,63 +272,52 @@ export default function sideChat(pi: ExtensionAPI): void {
 		const sessionDir = temporary ?? context.sessionManager.getSessionDir();
 		const sideSession = SessionManager.create(context.cwd, sessionDir, { parentSession: parentFile });
 		const sessionFile = sideSession.getSessionFile()!;
-		const entries = forkSide(sideSession.getHeader()!, branch, !context.isIdle(), { parentSessionId: header.id });
+		const sideHeader = sideSession.getHeader()!;
+		const entries = forkSide(sideHeader, branch, !context.isIdle(), { parentSessionId: header.id });
+		const thinking = pi.getThinkingLevel();
+		const view = new SideView(findInteractiveMode(context, KEY), entries, { model, thinkingLevel: thinking });
+		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		const sideModel = { provider: model.provider, id: model.id, thinking };
+		await launch(context, newSide(sideHeader, view, sessionFile, sessionDir, sideModel, temporary), sideModel, message);
+	};
+
+	/** Opens a side conversation saved by this session again, without showing it. */
+	const reattach = async (context: ExtensionContext, sessionFile: string) => {
+		const entries = readFileSync(sessionFile, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as FileEntry);
+		const header = entries[0] as SessionHeader;
+		const model = context.model!;
 		const view = new SideView(findInteractiveMode(context, KEY), entries, {
 			model,
 			thinkingLevel: pi.getThinkingLevel(),
 		});
-		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-		const current: Side = {
-			id: sideSession.getSessionId(),
-			view,
-			sessionFile,
-			sessionDir,
-			temporary,
-			commands: new Set(),
-			streaming: false,
-			model: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() },
-			forkedAt: new Date().toISOString(),
-			asked: false,
-			handingOff: false,
-		};
-		sides.push(current);
-		updateLabel(SIDE_STARTING_CONTEXT_LABEL);
-		try {
-			current.process = await SideProcess.start({
-				cwd: context.cwd,
-				sessionFile,
-				sessionDir,
-				provider: model.provider,
-				model: model.id,
-				thinking: pi.getThinkingLevel(),
-				ui: () => context.ui,
-				notify: (text, type) => view.notify(text, type),
-				setStatus: (key, text) => view.setStatus(key, text),
-				onEvent: (event) => handleEvent(current, event),
-				onExit: (reason) => {
-					if (!sides.includes(current)) return;
-					notifyError(`Side conversation ended: ${reason}`);
-					void close(current);
-				},
-			});
-		} catch (error) {
-			await close(current);
-			notifyError(`Failed to start side conversation: ${(error as Error).message}`);
-			if (message) context.ui.setEditorText(message);
-			return;
-		}
-		if (!sides.includes(current)) {
-			await current.process.close();
-			return;
-		}
-		// The footer shows the session name, so the side's id is in view for resuming it later.
-		await current.process.setSessionName(`Side ${current.id}`);
-		for (const info of await current.process.commands()) {
-			if (!COMMANDS.includes(info)) current.commands.add(info);
-		}
-		view.attach(current.process);
-		show(current);
-		if (message) submit(current, message);
+		const current = newSide(header, view, sessionFile, dirname(sessionFile), {
+			provider: model.provider,
+			id: model.id,
+			thinking: pi.getThinkingLevel(),
+		});
+		current.asked = true;
+		view.replay();
+		await launch(context, current, undefined);
+	};
+
+	/** Records in the main session which saved side conversations are open, so they come back with it. */
+	const remember = () => {
+		const open = sides.filter((side) => side.asked && !side.temporary).map((side) => side.sessionFile);
+		pi.appendEntry<OpenSides>(OPEN_SIDES_TYPE, { sessionFiles: open });
+	};
+
+	/** Opens the side conversations that were open when this session was last left. */
+	const restore = async (context: ExtensionContext) => {
+		const record = context.sessionManager
+			.getEntries()
+			.findLast((entry) => entry.type === "custom" && entry.customType === OPEN_SIDES_TYPE);
+		const files = record?.type === "custom" ? (record.data as OpenSides).sessionFiles : [];
+		const missing = files.filter((file) => !existsSync(file));
+		if (missing.length > 0) context.ui.notify(`Side conversations no longer saved: ${missing.join(", ")}`, "warning");
+		for (const file of files) if (existsSync(file)) await reattach(context, file);
 	};
 
 	/**
@@ -345,13 +426,17 @@ export default function sideChat(pi: ExtensionAPI): void {
 
 	pi.on("session_start", (_event, context) => {
 		ctx = context;
+		leaving = false;
 		parentSessionId = sideOrigin(context.sessionManager.getEntries())?.parentSessionId;
-		if (context.mode === "tui") stopKeys = context.ui.onTerminalInput(handleKey);
+		if (context.mode !== "tui") return;
+		stopKeys = context.ui.onTerminalInput(handleKey);
+		if (context.model) restore(context).catch((error: Error) => notifyError(`Failed to reopen side conversations: ${error.message}`));
 	});
 
 	pi.on("session_shutdown", async () => {
 		stopKeys?.();
 		stopKeys = undefined;
+		leaving = true;
 		await Promise.all([...sides].map(close));
 		ctx?.ui.setWidget(KEY, undefined);
 		ctx = undefined;
