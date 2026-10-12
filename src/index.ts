@@ -49,8 +49,6 @@ type Side = {
 	sessionDir: string;
 	/** A directory that holds the session of a parent that is not saved itself, removed on close. */
 	temporary?: string;
-	/** Whether the side session has a display name yet. */
-	named: boolean;
 	/** Commands the side session runs itself, such as extension commands, prompt templates and skills. */
 	commands: Set<string>;
 	streaming: boolean;
@@ -150,11 +148,6 @@ export default function sideChat(pi: ExtensionAPI): void {
 			return;
 		}
 		current.process?.prompt(text, current.streaming).catch((error: Error) => notifyError(error.message));
-		if (!current.named) {
-			current.named = true;
-			const name = `Side: ${text.split("\n")[0]!.slice(0, 60)}`;
-			current.process?.setSessionName(name).catch((error: Error) => notifyError(error.message));
-		}
 	};
 
 	const handleEvent = (current: Side, event: SideEvent) => {
@@ -199,7 +192,6 @@ export default function sideChat(pi: ExtensionAPI): void {
 			sessionFile,
 			sessionDir,
 			temporary,
-			named: false,
 			commands: new Set(),
 			streaming: false,
 			model: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() },
@@ -237,6 +229,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 			await current.process.close();
 			return;
 		}
+		// The footer shows the session name, so the side's id is in view for resuming it later.
+		await current.process.setSessionName(`Side ${current.id}`);
 		for (const info of await current.process.commands()) {
 			if (!COMMANDS.includes(info)) current.commands.add(info);
 		}
