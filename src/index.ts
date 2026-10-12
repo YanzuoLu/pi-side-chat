@@ -5,12 +5,13 @@
  * level, extensions and session id, and shows it in place of the parent's conversation. Codex's hidden
  * side instructions follow the inherited history, so the model answers questions without continuing
  * the parent's work. Ctrl+/ switches between the two without closing either, and Ctrl+C on an empty
- * editor closes the side conversation. Nothing of it is saved.
+ * editor closes the side conversation. Ctrl+S closes it too, after it writes a handoff of what happened
+ * in it, which is steered into the main thread. Nothing of it is saved.
  */
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentEndEvent, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { type AgentEndEvent, type ExtensionAPI, type ExtensionContext, getAgentDir } from "@earendil-works/pi-coding-agent";
 import { isKeyRelease, matchesKey } from "@earendil-works/pi-tui";
 import { type SideEvent, SideProcess } from "./child.ts";
 import {
@@ -19,11 +20,15 @@ import {
 	SIDE_STARTING_CONTEXT_LABEL,
 } from "./codex.ts";
 import { forkSide, hasStarted } from "./fork.ts";
+import { HANDOFF_PROMPT, handoffMessage, readHandoffConfig } from "./handoff.ts";
 import { findInteractiveMode, SideView } from "./view.ts";
 
 const KEY = "side-chat";
 const TOGGLE_LABEL = "ctrl + /";
 const CLOSE_LABEL = "ctrl + c";
+const HANDOFF_LABEL = "ctrl + s";
+const HANDING_OFF_LABEL = "Side summarizing...";
+const CONFIG_FILE = "pi-side-chat.json";
 const COMMANDS = ["side", "btw"];
 
 type Side = {
@@ -33,6 +38,14 @@ type Side = {
 	/** Commands the side session runs itself, such as extension commands, prompt templates and skills. */
 	commands: Set<string>;
 	streaming: boolean;
+	/** The model and thinking level the side conversation runs with. */
+	model: { provider: string; id: string; thinking: string };
+	/** When the side conversation was forked from the main thread. */
+	forkedAt: string;
+	/** Whether the user has said anything in the side conversation. */
+	asked: boolean;
+	/** Whether the side conversation is writing its handoff. */
+	handingOff: boolean;
 	/** How the parent's turn ended while the side conversation was open, as Codex labels it. */
 	parentStatus?: string;
 };
@@ -54,8 +67,10 @@ export default function sideChat(pi: ExtensionAPI): void {
 		if (!text && side?.view.visible) {
 			const parts = ["from main thread"];
 			if (side.parentStatus) parts.push(side.parentStatus);
-			parts.push(`${TOGGLE_LABEL} to switch`, `${CLOSE_LABEL} to close`);
+			parts.push(`${TOGGLE_LABEL} to switch`, `${HANDOFF_LABEL} to hand off`, `${CLOSE_LABEL} to close`);
 			text = `Side ${parts.join(" · ")}`;
+		} else if (!text && side?.handingOff) {
+			text = HANDING_OFF_LABEL;
 		} else if (!text && side) {
 			text = `${TOGGLE_LABEL} for side`;
 		}
@@ -97,6 +112,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 	const handleEvent = (current: Side, event: SideEvent) => {
 		if (event.type === "agent_start") current.streaming = true;
 		if (event.type === "agent_end") current.streaming = false;
+		if (event.type === "message_start" && (event.message as { role?: string }).role === "user") current.asked = true;
 		current.view.draw(event);
 	};
 
@@ -129,7 +145,16 @@ export default function sideChat(pi: ExtensionAPI): void {
 		const directory = mkdtempSync(join(tmpdir(), "pi-side-chat-"));
 		const sessionFile = join(directory, "side.jsonl");
 		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-		const current: Side = { view, directory, commands: new Set(), streaming: false };
+		const current: Side = {
+			view,
+			directory,
+			commands: new Set(),
+			streaming: false,
+			model: { provider: model.provider, id: model.id, thinking: pi.getThinkingLevel() },
+			forkedAt: new Date().toISOString(),
+			asked: false,
+			handingOff: false,
+		};
 		side = current;
 		updateLabel(SIDE_STARTING_CONTEXT_LABEL);
 		try {
@@ -168,17 +193,61 @@ export default function sideChat(pi: ExtensionAPI): void {
 		if (message) submit(current, message);
 	};
 
-	/** Ctrl+/ switches views, and in the side view Ctrl+C on an empty editor closes it and Esc stops it. */
+	/**
+	 * Closes the side conversation after it writes a handoff, which is steered into the main thread.
+	 * The main thread shows meanwhile. If the handoff fails, the side conversation stays open as it was.
+	 */
+	const handOff = async (current: Side) => {
+		const child = current.process!;
+		if (!current.asked) return close();
+		current.handingOff = true;
+		hide(current);
+		let switched = false;
+		try {
+			if (current.streaming) await child.abort();
+			const config = readHandoffConfig(join(getAgentDir(), CONFIG_FILE));
+			if (config.model || config.thinking) {
+				switched = true;
+				if (config.model) await child.setModel(config.model.provider, config.model.id);
+				await child.setThinkingLevel(config.thinking ?? current.model.thinking);
+			}
+			const handoff = await child.reply(HANDOFF_PROMPT);
+			if (side !== current) return;
+			pi.sendMessage(
+				{ customType: "side-handoff", content: handoffMessage(handoff, current.forkedAt), display: true },
+				{ deliverAs: "steer", triggerTurn: true },
+			);
+			await close();
+		} catch (error) {
+			if (side !== current) return;
+			current.handingOff = false;
+			updateLabel();
+			notifyError(`Failed to hand off side conversation: ${(error as Error).message}`);
+			if (switched) {
+				await child.setModel(current.model.provider, current.model.id).catch(() => {});
+				await child.setThinkingLevel(current.model.thinking).catch(() => {});
+			}
+		}
+	};
+
+	/**
+	 * Ctrl+/ switches views. In the side view Ctrl+S hands it off, Ctrl+C on an empty editor closes it
+	 * and Esc stops it.
+	 */
 	const handleKey = (data: string): { consume: true } | undefined => {
 		const current = side;
 		// Terminals with the kitty keyboard protocol also report releases, which would act a second time.
-		if (!current?.process || !ctx || isKeyRelease(data)) return undefined;
+		if (!current?.process || current.handingOff || !ctx || isKeyRelease(data)) return undefined;
 		if (matchesKey(data, "ctrl+/") || matchesKey(data, "ctrl+7")) {
 			if (current.view.visible) hide(current);
 			else show(current);
 			return { consume: true };
 		}
 		if (!current.view.visible || !current.view.editorFocused) return undefined;
+		if (matchesKey(data, "ctrl+s")) {
+			void handOff(current);
+			return { consume: true };
+		}
 		if (matchesKey(data, "ctrl+c") && ctx.ui.getEditorText() === "") {
 			void close();
 			return { consume: true };

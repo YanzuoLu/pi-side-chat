@@ -174,6 +174,7 @@ export class SideView {
 	private source: { entries(since: string): Promise<SessionEntry[]>; state(): Promise<SideState> } | undefined;
 	private drawing = Promise.resolve();
 	private shown = false;
+	private disposed = false;
 	private parentIndicator: Indicator | undefined;
 	private sideIndicator: Indicator | undefined;
 	private parentDraft = "";
@@ -281,6 +282,7 @@ export class SideView {
 		if (!DRAWN_EVENTS.has(event.type) && !CHANGING_EVENTS.has(event.type)) return;
 		const drawn = this.message.track(event);
 		this.drawing = this.drawing.then(async () => {
+			if (this.disposed) return;
 			// Pi persists a message after drawing it, and compares it against the entries before it.
 			const until = event.type === "message_end" ? (event.message as { timestamp: number }).timestamp : undefined;
 			if (DRAWN_FROM_ENTRIES.has(event.type)) await this.sync();
@@ -335,6 +337,7 @@ export class SideView {
 
 	/** Brings the parent's conversation back for good and stops the side's indicators. */
 	dispose(): void {
+		this.disposed = true;
 		this.hide();
 		for (const slot of this.slots) slot.restore();
 		delete (this.mode as unknown as Record<string, unknown>).setEditorWorkingStatusIndicator;
@@ -358,8 +361,17 @@ export class SideView {
 	 * and with what its footer shows.
 	 */
 	private async sync(until?: number): Promise<void> {
-		if (!this.source) return;
-		const [added, state] = await Promise.all([this.source.entries(this.entries.at(-1)!.id), this.source.state()]);
+		if (!this.source || this.disposed) return;
+		let added: SessionEntry[];
+		let state: SideState;
+		try {
+			[added, state] = await Promise.all([this.source.entries(this.entries.at(-1)!.id), this.source.state()]);
+		} catch (error) {
+			// Closing the side conversation ends its process, and with it any catching up still on the way.
+			if (this.disposed) return;
+			throw error;
+		}
+		if (this.disposed) return;
 		const end = until === undefined
 			? added.length
 			: added.findIndex((entry) => entry.type === "message" && entry.message.timestamp === until) + 1 || added.length;

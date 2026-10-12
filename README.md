@@ -11,10 +11,23 @@ Codex's `/side` conversations for [Pi](https://pi.dev).
 | `/side` or `/btw` | Open a side conversation and wait for your question |
 | `/side <question>` | Open a side conversation and ask the question |
 | `ctrl + /` (or `ctrl + 7`) | Switch between the side conversation and the main thread without closing either |
+| `ctrl + s` | Hand off: close the side conversation after it writes a handoff, which is steered into the main thread |
 | `ctrl + c` on an empty editor | Close the side conversation and return to the main thread |
 | `esc` | Stop the side conversation's current turn |
 
 Only one side conversation is open at a time. It is never saved.
+
+## Handoff
+
+`ctrl + s` brings what happened in the side conversation back to the main thread. The main thread shows right away while the side conversation writes a handoff: what you asked and found there, decisions and requests you stated (quoted), and anything it changed. The handoff is steered into the main thread, so a working main thread sees it before its next model request and an idle one starts a turn with it. If writing the handoff fails, the side conversation stays open. A side conversation where you have not asked anything just closes.
+
+By default the side conversation's own model and thinking level write the handoff, which reuses its prompt cache. `~/.pi/agent/pi-side-chat.json` can choose others:
+
+```json
+{ "handoff": { "model": "anthropic/claude-opus-5-5", "thinking": "low" } }
+```
+
+`model` is `provider/model-id`. `null` or a missing setting keeps the side conversation's own.
 
 ## Behavior
 

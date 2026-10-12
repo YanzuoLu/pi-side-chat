@@ -47,6 +47,8 @@ export class SideProcess {
 	private readonly child: ChildProcessWithoutNullStreams;
 	private readonly pending = new Map<string, (response: Response) => void>();
 	private nextId = 0;
+	/** Followers of the session's events, told with undefined when the process ends. */
+	private readonly watchers = new Set<(event: SideEvent | undefined) => void>();
 	private stderr = "";
 	private closing = false;
 	private readonly exited: Promise<void>;
@@ -75,6 +77,7 @@ export class SideProcess {
 				const reason = this.stderr.trim() || `exited with ${signal ?? `code ${code}`}`;
 				for (const resolvePending of this.pending.values()) resolvePending({ success: false, error: reason });
 				this.pending.clear();
+				for (const watcher of this.watchers) watcher(undefined);
 				if (!this.closing) options.onExit(reason);
 				resolve();
 			});
@@ -111,6 +114,54 @@ export class SideProcess {
 			this.request({ type: "get_session_stats" }),
 		])) as [Omit<SideState, "contextUsage">, { contextUsage?: ContextUsage }];
 		return { ...state, contextUsage: stats.contextUsage };
+	}
+
+	/** Switches the side session to another model. Its thinking level follows Pi's rules for a model switch. */
+	async setModel(provider: string, modelId: string): Promise<void> {
+		await this.request({ type: "set_model", provider, modelId });
+	}
+
+	async setThinkingLevel(level: string): Promise<void> {
+		await this.request({ type: "set_thinking_level", level });
+	}
+
+	/**
+	 * Sends a message while the side session is idle and returns the text of its last reply once it
+	 * settles. A reply that calls a tool is stopped, since only text is wanted.
+	 */
+	async reply(message: string): Promise<string> {
+		let last: { stopReason?: string; errorMessage?: string; content?: Array<{ type: string; text?: string }> } | undefined;
+		let calledTool = false;
+		let watcher: ((event: SideEvent | undefined) => void) | undefined;
+		const settled = new Promise<void>((resolve, reject) => {
+			watcher = (event) => {
+				if (!event) return reject(new Error("the side conversation ended"));
+				if (event.type === "message_end" && (event.message as { role?: string }).role === "assistant") {
+					last = event.message as typeof last;
+				} else if (event.type === "tool_execution_start" && !calledTool) {
+					calledTool = true;
+					this.abort().catch(() => {});
+				} else if (event.type === "agent_settled") {
+					resolve();
+				}
+			};
+			this.watchers.add(watcher);
+		});
+		// The process can end before the prompt is accepted, with nothing awaiting `settled` yet.
+		settled.catch(() => {});
+		try {
+			await this.prompt(message, false);
+			await settled;
+		} finally {
+			this.watchers.delete(watcher!);
+		}
+		if (calledTool) throw new Error("the model called a tool instead of replying");
+		if (last?.stopReason === "error" || last?.stopReason === "aborted") {
+			throw new Error(last.errorMessage ?? `the reply was ${last.stopReason}`);
+		}
+		const text = (last?.content ?? []).filter((block) => block.type === "text").map((block) => block.text).join("").trim();
+		if (!text) throw new Error("the model replied with no text");
+		return text;
 	}
 
 	/** Stops whatever the side session is doing: its turn, a retry or a compaction. */
@@ -159,6 +210,7 @@ export class SideProcess {
 		} else if (message.type === "extension_ui_request") {
 			void this.answer(message);
 		} else {
+			for (const watcher of this.watchers) watcher(message);
 			this.options.onEvent(message);
 		}
 	}
