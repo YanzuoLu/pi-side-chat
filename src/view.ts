@@ -1,9 +1,9 @@
 /**
  * The side conversation's view, drawn by Pi's own interactive mode.
  *
- * Like switching threads in Codex, showing the side conversation swaps everything that belongs to a
+ * Like switching threads in Codex, showing a side conversation swaps everything that belongs to a
  * conversation: the transcript, the working and compaction indicators, the footer and the editor's
- * draft. Pi has no extension API for a second conversation view, so this module reaches into its
+ * draft. Any number of side conversations can be open, one of them or the parent's shown at a time. Pi has no extension API for a second conversation view, so this module reaches into its
  * interactive mode. Everything that depends on those internals stays here: if a Pi release changes
  * them, the checks in `findInteractiveMode` fail loudly instead of drawing something different.
  */
@@ -104,7 +104,8 @@ export function findInteractiveMode(ctx: ExtensionContext, statusKey: string): I
 	if (
 		!mode ||
 		!(mode.chatContainer instanceof Container) ||
-		!mode.documentContainer?.children.includes(mode.chatContainer) ||
+		// While a side conversation is shown, its chat stands where the parent's does.
+		!(Stage.has(mode as Interactive) || mode.documentContainer?.children.includes(mode.chatContainer)) ||
 		!(mode.statusContainer instanceof Container) ||
 		!(mode.footerContainer instanceof Container) ||
 		!writable("statusContainer") ||
@@ -124,7 +125,7 @@ export function findInteractiveMode(ctx: ExtensionContext, statusKey: string): I
 	return mode as Interactive;
 }
 
-/** A container in Pi's layout that shows either the parent's content or the side conversation's. */
+/** A container in Pi's layout that shows either the parent's content or a side conversation's. */
 class Slot {
 	private readonly layout: Container;
 	private readonly parent = new Container();
@@ -151,6 +152,108 @@ class Slot {
 }
 
 /**
+ * What one interactive mode shows: the parent's conversation or one of its open side conversations.
+ * It holds what they share, the layout, the editor and the working indicator in its border, and
+ * gives each back what belongs to it when it shows again.
+ */
+class Stage {
+	private static readonly stages = new WeakMap<Interactive, Stage>();
+	current: SideView | undefined;
+	private readonly views = new Set<SideView>();
+	private readonly slots: Slot[];
+	private parentIndicator: Indicator | undefined;
+	private parentDraft = "";
+	private parentSubmit: Editor["onSubmit"];
+
+	static has(mode: Interactive): boolean {
+		return Stage.stages.has(mode);
+	}
+
+	static for(mode: Interactive): Stage {
+		let stage = Stage.stages.get(mode);
+		if (!stage) {
+			stage = new Stage(mode);
+			Stage.stages.set(mode, stage);
+		}
+		return stage;
+	}
+
+	private constructor(readonly mode: Interactive) {
+		// The parent's indicators keep going to the parent while a side conversation is shown.
+		this.parentIndicator = mode.editor.workingStatusIndicator;
+		(mode as unknown as Record<string, unknown>).setEditorWorkingStatusIndicator = (indicator: Indicator | undefined) => {
+			this.parentIndicator = indicator;
+			return this.current ? this.embedsIndicator() : setIndicator.call(mode, indicator);
+		};
+		this.slots = [new Slot(mode, "statusContainer"), new Slot(mode, "footerContainer")];
+	}
+
+	add(view: SideView): void {
+		this.views.add(view);
+	}
+
+	/** Shows `view`, with the editor submitting to `submit`, in place of what is shown now. */
+	show(view: SideView, submit: (text: string) => void): void {
+		if (this.current === view) return;
+		const editor = this.mode.editor;
+		if (this.current) {
+			this.current.leave(editor.getText());
+		} else {
+			this.parentDraft = editor.getText();
+			this.parentSubmit = editor.onSubmit;
+		}
+		this.swapChat(this.current?.chat ?? this.mode.chatContainer, view.chat);
+		this.current = view;
+		this.slots[0]!.show(view.status);
+		this.slots[1]!.show(view.footer);
+		setIndicator.call(this.mode, view.indicator);
+		editor.setText(view.draft);
+		editor.onSubmit = (text) => {
+			if (text.trim()) editor.addToHistory?.(text.trim());
+			submit(text);
+		};
+		this.mode.ui.requestRender(true);
+	}
+
+	/** Brings the parent's conversation back. */
+	showParent(): void {
+		const view = this.current;
+		if (!view) return;
+		const editor = this.mode.editor;
+		view.leave(editor.getText());
+		this.current = undefined;
+		this.swapChat(view.chat, this.mode.chatContainer);
+		for (const slot of this.slots) slot.show(undefined);
+		setIndicator.call(this.mode, this.parentIndicator);
+		editor.setText(this.parentDraft);
+		editor.onSubmit = this.parentSubmit;
+		this.mode.ui.requestRender(true);
+	}
+
+	/** Forgets `view`, and gives the layout back to the parent once no side conversation is left. */
+	remove(view: SideView): void {
+		if (this.current === view) this.showParent();
+		this.views.delete(view);
+		if (this.views.size > 0) return;
+		for (const slot of this.slots) slot.restore();
+		delete (this.mode as unknown as Record<string, unknown>).setEditorWorkingStatusIndicator;
+		Stage.stages.delete(this.mode);
+		this.mode.ui.requestRender(true);
+	}
+
+	/** Whether Pi shows working indicators inside the editor's border, as `setEditorWorkingStatusIndicator` reports. */
+	embedsIndicator(): boolean {
+		const editor = this.mode.editor;
+		return editor.embedWorkingStatus === true && typeof editor.setWorkingStatusIndicator === "function";
+	}
+
+	private swapChat(from: Container, to: Container): void {
+		const children = this.mode.documentContainer.children;
+		children[children.indexOf(from)] = to;
+	}
+}
+
+/**
  * The side conversation's view, which takes the place of the parent's while it is shown.
  *
  * Pi's own event handler draws it, through an object that inherits everything from the interactive
@@ -159,13 +262,16 @@ class Slot {
  * the parent.
  */
 export class SideView {
-	private readonly chat = new Container();
-	private readonly status = new Container();
-	private readonly footer: Component;
+	readonly chat = new Container();
+	readonly status = new Container();
+	readonly footer: Component;
+	/** The side's working indicator, and its editor draft while it is not shown. */
+	indicator: Indicator | undefined;
+	draft = "";
 	private readonly statuses = new Map<string, string>();
 	private readonly renderer: Interactive;
 	private readonly message = new StreamingMessage();
-	private readonly slots: Slot[];
+	private readonly stage: Stage;
 	private readonly header: SessionHeader;
 	private entries: SessionEntry[];
 	private session: SessionManager;
@@ -173,13 +279,7 @@ export class SideView {
 	private retryAttempt = 0;
 	private source: { entries(since: string): Promise<SessionEntry[]>; state(): Promise<SideState> } | undefined;
 	private drawing = Promise.resolve();
-	private shown = false;
 	private disposed = false;
-	private parentIndicator: Indicator | undefined;
-	private sideIndicator: Indicator | undefined;
-	private parentDraft = "";
-	private sideDraft = "";
-	private parentSubmit: Editor["onSubmit"];
 
 	/**
 	 * @param fork the side session as forked, header first
@@ -189,6 +289,7 @@ export class SideView {
 		fork: readonly FileEntry[],
 		state: Omit<SideState, "autoCompactionEnabled">,
 	) {
+		this.stage = Stage.for(mode);
 		this.header = fork[0] as SessionHeader;
 		this.entries = fork.slice(1) as SessionEntry[];
 		this.session = this.mirror();
@@ -230,8 +331,8 @@ export class SideView {
 			// Esc is handled by the side conversation itself, which stops whatever it is doing.
 			defaultEditor: own({ onEscape: undefined, setWorkingStatusIndicator() {} }),
 			setEditorWorkingStatusIndicator: own((indicator: Indicator | undefined) => {
-				view.sideIndicator = indicator;
-				return view.shown ? setIndicator.call(mode, indicator) : view.embedsIndicator();
+				view.indicator = indicator;
+				return view.visible ? setIndicator.call(mode, indicator) : view.stage.embedsIndicator();
 			}),
 			// The terminal's progress and the pending message list belong to the parent.
 			settingsManager: own(Object.create((mode as unknown as { settingsManager: object }).settingsManager, {
@@ -251,14 +352,7 @@ export class SideView {
 		});
 		footer.setAutoCompactEnabled(this.state.autoCompactionEnabled);
 		this.footer = footer;
-
-		// The parent's indicators keep going to the parent while the side conversation is shown.
-		this.parentIndicator = mode.editor.workingStatusIndicator;
-		(mode as unknown as Record<string, unknown>).setEditorWorkingStatusIndicator = (indicator: Indicator | undefined) => {
-			view.parentIndicator = indicator;
-			return view.shown ? view.embedsIndicator() : setIndicator.call(mode, indicator);
-		};
-		this.slots = [new Slot(mode, "statusContainer"), new Slot(mode, "footerContainer")];
+		this.stage.add(this);
 	}
 
 	/** Connects the view to the side session it shows. */
@@ -268,7 +362,7 @@ export class SideView {
 	}
 
 	get visible(): boolean {
-		return this.shown;
+		return this.stage.current === this;
 	}
 
 	/** Whether the editor has focus without a popup, so keys reach the conversation rather than a dialog. */
@@ -304,56 +398,27 @@ export class SideView {
 		this.mode.ui.requestRender();
 	}
 
-	/** Shows the side conversation in place of the parent's, with the editor submitting to `submit`. */
+	/** Shows the side conversation in place of what is shown now, with the editor submitting to `submit`. */
 	show(submit: (text: string) => void): void {
-		if (this.shown) return;
-		this.shown = true;
-		this.swapChat(this.mode.chatContainer, this.chat);
-		this.slots[0]!.show(this.status);
-		this.slots[1]!.show(this.footer);
-		setIndicator.call(this.mode, this.sideIndicator);
-		this.parentDraft = this.mode.editor.getText();
-		this.mode.editor.setText(this.sideDraft);
-		this.parentSubmit = this.mode.editor.onSubmit;
-		this.mode.editor.onSubmit = (text) => {
-			if (text.trim()) this.mode.editor.addToHistory?.(text.trim());
-			submit(text);
-		};
-		this.mode.ui.requestRender(true);
+		this.stage.show(this, submit);
 	}
 
-	/** Brings the parent's conversation back. */
+	/** Brings the parent's conversation back if this side conversation is shown. */
 	hide(): void {
-		if (!this.shown) return;
-		this.shown = false;
-		this.swapChat(this.chat, this.mode.chatContainer);
-		for (const slot of this.slots) slot.show(undefined);
-		setIndicator.call(this.mode, this.parentIndicator);
-		this.sideDraft = this.mode.editor.getText();
-		this.mode.editor.setText(this.parentDraft);
-		this.mode.editor.onSubmit = this.parentSubmit;
-		this.mode.ui.requestRender(true);
+		if (this.visible) this.stage.showParent();
 	}
 
-	/** Brings the parent's conversation back for good and stops the side's indicators. */
+	/** Keeps the editor's draft for when this side conversation shows again. */
+	leave(draft: string): void {
+		this.draft = draft;
+	}
+
+	/** Takes the side conversation off the screen for good and stops its indicators. */
 	dispose(): void {
 		this.disposed = true;
-		this.hide();
-		for (const slot of this.slots) slot.restore();
-		delete (this.mode as unknown as Record<string, unknown>).setEditorWorkingStatusIndicator;
+		this.stage.remove(this);
 		this.renderer.activeStatusIndicator?.dispose();
 		this.mode.ui.requestRender(true);
-	}
-
-	/** Whether Pi shows working indicators inside the editor's border, as `setEditorWorkingStatusIndicator` reports. */
-	private embedsIndicator(): boolean {
-		const editor = this.mode.editor;
-		return editor.embedWorkingStatus === true && typeof editor.setWorkingStatusIndicator === "function";
-	}
-
-	private swapChat(from: Container, to: Container): void {
-		const children = this.mode.documentContainer.children;
-		children[children.indexOf(from)] = to;
 	}
 
 	/**

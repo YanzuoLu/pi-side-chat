@@ -8,14 +8,15 @@ Codex's `/side` conversations for [Pi](https://pi.dev).
 
 | Input | Effect |
 |---|---|
-| `/side` or `/btw` | Open a side conversation and wait for your question |
-| `/side <question>` | Open a side conversation and ask the question |
-| `ctrl + /` (or `ctrl + 7`) | Switch between the side conversation and the main thread without closing either |
-| `ctrl + s` | Hand off: close the side conversation after it writes a handoff, which is steered into the main thread |
-| `ctrl + c` on an empty editor | Close the side conversation and return to the main thread |
+| `/side` or `/btw` | Open a new side conversation and wait for your question |
+| `/side <question>` | Open a new side conversation and ask the question |
+| `ctrl + /` (or `ctrl + 7`) | Switch between the main thread and the side conversation shown last, without closing either |
+| `shift + ←` / `shift + →` | Go through the main thread and every open side conversation in order |
+| `ctrl + s` | Hand off: close the side conversation shown after it writes a handoff, which is steered into the main thread |
+| `ctrl + c` on an empty editor | Close the side conversation shown and return to the main thread |
 | `esc` | Stop the side conversation's current turn |
 
-Only one side conversation is open at a time. Once you ask something in it, it is saved as a session of its own next to the main thread's, named after your first question. Closing it shows its id, and `pi --session <id>` resumes it in any window. A side conversation where you asked nothing is not kept.
+Each `/side` opens another side conversation forked from the main thread, also when typed in a side conversation. Each runs as its own Pi process, so many open ones take memory. Once you ask something in it, it is saved as a session of its own next to the main thread's, named after your first question. Closing it shows its id, and `pi --session <id>` resumes it in any window. A side conversation where you asked nothing is not kept.
 
 ## Handoff
 

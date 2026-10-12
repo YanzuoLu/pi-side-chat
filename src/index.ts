@@ -4,8 +4,9 @@
  * `/side` (or `/btw`) forks the conversation into a separate Pi process with the same model, thinking
  * level and extensions, and shows it in place of the parent's conversation. Codex's hidden
  * side instructions follow the inherited history, so the model answers questions without continuing
- * the parent's work. Ctrl+/ switches between the two without closing either, and Ctrl+C on an empty
- * editor closes the side conversation. Ctrl+S closes it too, after it writes a handoff of what happened
+ * the parent's work. Each `/side` opens another one. Ctrl+/ switches between the main thread and the
+ * side conversation shown last, Shift+Left and Shift+Right through all of them, without closing any.
+ * Ctrl+C on an empty editor closes the side conversation shown. Ctrl+S closes it too, after it writes a handoff of what happened
  * in it, which is steered into the main thread. A side conversation the user asked something in is
  * saved as a session of its own, which `pi --session <id>` resumes like any other.
  */
@@ -32,6 +33,7 @@ import { findInteractiveMode, SideView } from "./view.ts";
 
 const KEY = "side-chat";
 const TOGGLE_LABEL = "ctrl + /";
+const SWITCH_LABEL = "shift + ←/→";
 const CLOSE_LABEL = "ctrl + c";
 const HANDOFF_LABEL = "ctrl + s";
 const HANDING_OFF_LABEL = "Side summarizing...";
@@ -66,32 +68,51 @@ type Side = {
 
 export default function sideChat(pi: ExtensionAPI): void {
 	let ctx: ExtensionContext | undefined;
-	let side: Side | undefined;
+	/** The open side conversations, oldest first. */
+	const sides: Side[] = [];
+	/** The side conversation shown last, which Ctrl+/ returns to. */
+	let last: Side | undefined;
 	let stopKeys: (() => void) | undefined;
 
-	/** Errors about the side conversation go to whichever transcript is shown. */
+	const shown = () => sides.find((side) => side.view.visible);
+	/** The side conversations one can switch to: those running and not writing a handoff. */
+	const switchable = () => sides.filter((side) => side.process && !side.handingOff);
+
+	/** Errors about a side conversation go to whichever transcript is shown. */
 	const notifyError = (message: string) => {
-		if (side?.view.visible) side.view.notify(message, "error");
+		const current = shown();
+		if (current) current.view.notify(message, "error");
 		else ctx?.ui.notify(message, "error");
 	};
 
+	/** Codex's labels for one side conversation, numbered and switched with Shift+arrows once there are more. */
 	const updateLabel = (label?: string) => {
 		if (!ctx) return;
+		const open = switchable();
+		const current = shown();
 		let text = label;
-		if (!text && side?.view.visible) {
-			const parts = ["from main thread"];
-			if (side.parentStatus) parts.push(side.parentStatus);
-			parts.push(`${TOGGLE_LABEL} to switch`, `${HANDOFF_LABEL} to hand off`, `${CLOSE_LABEL} to close`);
+		if (!text && current) {
+			const index = open.indexOf(current) + 1;
+			const parts = [open.length > 1 ? `${index}/${open.length} from main thread` : "from main thread"];
+			if (current.parentStatus) parts.push(current.parentStatus);
+			parts.push(
+				open.length > 1 ? `${SWITCH_LABEL} to switch` : `${TOGGLE_LABEL} to switch`,
+				`${HANDOFF_LABEL} to hand off`,
+				`${CLOSE_LABEL} to close`,
+			);
 			text = `Side ${parts.join(" · ")}`;
-		} else if (!text && side?.handingOff) {
-			text = HANDING_OFF_LABEL;
-		} else if (!text && side) {
-			text = `${TOGGLE_LABEL} for side`;
+		} else if (!text) {
+			const parts: string[] = [];
+			if (sides.some((side) => side.handingOff)) parts.push(HANDING_OFF_LABEL);
+			if (open.length === 1) parts.push(`${TOGGLE_LABEL} for side`);
+			if (open.length > 1) parts.push(`${open.length} sides`, `${SWITCH_LABEL} to switch`);
+			text = parts.join(" · ") || undefined;
 		}
 		ctx.ui.setWidget(KEY, text ? [ctx.ui.theme.fg("dim", text)] : undefined);
 	};
 
 	const show = (current: Side) => {
+		last = current;
 		current.view.show((text: string) => submit(current, text));
 		updateLabel();
 	};
@@ -101,10 +122,11 @@ export default function sideChat(pi: ExtensionAPI): void {
 		updateLabel();
 	};
 
-	const close = async () => {
-		const current = side;
-		if (!current) return;
-		side = undefined;
+	const close = async (current: Side) => {
+		const index = sides.indexOf(current);
+		if (index < 0) return;
+		sides.splice(index, 1);
+		if (last === current) last = undefined;
 		current.view.dispose();
 		updateLabel();
 		await current.process?.close();
@@ -118,6 +140,11 @@ export default function sideChat(pi: ExtensionAPI): void {
 		if (!text || !ctx) return;
 		const command = /^\/([^\s/]+)(?:\s|$)/.exec(text)?.[1];
 		ctx.ui.setEditorText("");
+		// Another side conversation forks from the main thread, as if asked there.
+		if (command !== undefined && COMMANDS.includes(command)) {
+			open(ctx, text.slice(command.length + 1).trim()).catch((error: Error) => notifyError(error.message));
+			return;
+		}
 		if (command !== undefined && !current.commands.has(command)) {
 			notifyError(`'/${command}' is unavailable in side conversations. ${SIDE_SLASH_COMMAND_UNAVAILABLE_HINT}`);
 			return;
@@ -137,13 +164,9 @@ export default function sideChat(pi: ExtensionAPI): void {
 		current.view.draw(event);
 	};
 
+	/** Opens a new side conversation forked from the main thread, and asks `message` there if given. */
 	const open = async (context: ExtensionContext, message: string) => {
 		ctx = context;
-		if (side) {
-			if (!side.view.visible) show(side);
-			if (message) submit(side, message);
-			return;
-		}
 		const branch = context.sessionManager.getBranch();
 		const header = context.sessionManager.getHeader();
 		const model = context.model;
@@ -184,7 +207,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 			asked: false,
 			handingOff: false,
 		};
-		side = current;
+		sides.push(current);
 		updateLabel(SIDE_STARTING_CONTEXT_LABEL);
 		try {
 			current.process = await SideProcess.start({
@@ -199,18 +222,18 @@ export default function sideChat(pi: ExtensionAPI): void {
 				setStatus: (key, text) => view.setStatus(key, text),
 				onEvent: (event) => handleEvent(current, event),
 				onExit: (reason) => {
-					if (side !== current) return;
+					if (!sides.includes(current)) return;
 					notifyError(`Side conversation ended: ${reason}`);
-					void close();
+					void close(current);
 				},
 			});
 		} catch (error) {
-			if (side === current) await close();
+			await close(current);
 			notifyError(`Failed to start side conversation: ${(error as Error).message}`);
 			if (message) context.ui.setEditorText(message);
 			return;
 		}
-		if (side !== current) {
+		if (!sides.includes(current)) {
 			await current.process.close();
 			return;
 		}
@@ -228,7 +251,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 	 */
 	const handOff = async (current: Side) => {
 		const child = current.process!;
-		if (!current.asked) return close();
+		if (!current.asked) return close(current);
 		current.handingOff = true;
 		hide(current);
 		let switched = false;
@@ -241,14 +264,14 @@ export default function sideChat(pi: ExtensionAPI): void {
 				await child.setThinkingLevel(config.thinking ?? current.model.thinking);
 			}
 			const handoff = await child.reply(HANDOFF_PROMPT);
-			if (side !== current) return;
+			if (!sides.includes(current)) return;
 			pi.sendMessage(
 				{ customType: "side-handoff", content: handoffMessage(handoff, current.forkedAt), display: true },
 				{ deliverAs: "steer", triggerTurn: true },
 			);
-			await close();
+			await close(current);
 		} catch (error) {
-			if (side !== current) return;
+			if (!sides.includes(current)) return;
 			current.handingOff = false;
 			updateLabel();
 			notifyError(`Failed to hand off side conversation: ${(error as Error).message}`);
@@ -260,30 +283,42 @@ export default function sideChat(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Ctrl+/ switches views. In the side view Ctrl+S hands it off, Ctrl+C on an empty editor closes it
-	 * and Esc stops it.
+	 * Ctrl+/ switches between the main thread and the side conversation shown last, Shift+Left and
+	 * Shift+Right go through the main thread and every side conversation in order. In a side view
+	 * Ctrl+S hands it off, Ctrl+C on an empty editor closes it and Esc stops it.
 	 */
 	const handleKey = (data: string): { consume: true } | undefined => {
-		const current = side;
+		const open = switchable();
 		// Terminals with the kitty keyboard protocol also report releases, which would act a second time.
-		if (!current?.process || current.handingOff || !ctx || isKeyRelease(data)) return undefined;
+		if (open.length === 0 || !ctx || isKeyRelease(data)) return undefined;
+		const current = shown();
 		if (matchesKey(data, "ctrl+/") || matchesKey(data, "ctrl+7")) {
-			if (current.view.visible) hide(current);
-			else show(current);
+			if (current) hide(current);
+			else show(last && open.includes(last) ? last : open.at(-1)!);
 			return { consume: true };
 		}
-		if (!current.view.visible || !current.view.editorFocused) return undefined;
+		if (!open[0]!.view.editorFocused) return undefined;
+		const step = matchesKey(data, "shift+right") ? 1 : matchesKey(data, "shift+left") ? -1 : 0;
+		if (step !== 0) {
+			// Position 0 is the main thread, then the side conversations in the order they opened.
+			const at = current ? open.indexOf(current) + 1 : 0;
+			const next = (at + step + open.length + 1) % (open.length + 1);
+			if (next === 0) hide(current!);
+			else show(open[next - 1]!);
+			return { consume: true };
+		}
+		if (!current) return undefined;
 		if (matchesKey(data, "ctrl+s")) {
 			void handOff(current);
 			return { consume: true };
 		}
 		if (matchesKey(data, "ctrl+c") && ctx.ui.getEditorText() === "") {
-			void close();
+			void close(current);
 			return { consume: true };
 		}
 		if (matchesKey(data, "escape")) {
 			// Esc belongs to the side conversation here, never to the hidden parent.
-			current.process.abort().catch(() => {});
+			current.process!.abort().catch(() => {});
 			return { consume: true };
 		}
 		return undefined;
@@ -323,22 +358,23 @@ export default function sideChat(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", async () => {
 		stopKeys?.();
 		stopKeys = undefined;
-		await close();
+		await Promise.all([...sides].map(close));
 		ctx?.ui.setWidget(KEY, undefined);
 		ctx = undefined;
 	});
 
 	pi.on("agent_start", () => {
-		if (!side) return;
-		side.parentStatus = undefined;
+		if (sides.length === 0) return;
+		for (const side of sides) side.parentStatus = undefined;
 		updateLabel();
 	});
 
 	pi.on("agent_end", (event: AgentEndEvent) => {
-		if (!side) return;
-		const last = event.messages.findLast((message) => message.role === "assistant");
-		const reason = last && "stopReason" in last ? last.stopReason : undefined;
-		side.parentStatus = reason === "aborted" ? "main interrupted" : reason === "error" ? "main failed" : "main finished";
+		if (sides.length === 0) return;
+		const final = event.messages.findLast((message) => message.role === "assistant");
+		const reason = final && "stopReason" in final ? final.stopReason : undefined;
+		const status = reason === "aborted" ? "main interrupted" : reason === "error" ? "main failed" : "main finished";
+		for (const side of sides) side.parentStatus = status;
 		updateLabel();
 	});
 }
