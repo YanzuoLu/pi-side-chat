@@ -95,6 +95,9 @@ type SetIndicator = Interactive["setEditorWorkingStatusIndicator"];
 
 const prototype = InteractiveMode.prototype as unknown as Interactive;
 
+/** Where pi-tool-groups looks on a chat container for the conversation it shows, if not this session's. */
+const TOOL_GROUPS_CONVERSATION = Symbol.for("pi-tool-groups.conversation");
+
 /** Session events that Pi's interactive mode draws for the side conversation. */
 const DRAWN_EVENTS = new Set([
 	"agent_start",
@@ -341,6 +344,8 @@ export class SideView {
 	private state: SideState;
 	private retryAttempt = 0;
 	private streaming = false;
+	/** When each of the side's assistant turns, keyed by its start time, finished streaming. */
+	private readonly finished = new Map<number, number>();
 	private bashRunning = false;
 	/** The slash commands the side runs, which its editor completes. */
 	private commandNames = new Set<string>();
@@ -362,9 +367,15 @@ export class SideView {
 		this.session = this.mirror();
 		this.state = { ...state, autoCompactionEnabled: mode.session.autoCompactionEnabled };
 
-		// Keep whatever an extension changed about drawing the chat, such as grouping tool calls.
+		// Keep whatever an extension changed about drawing the chat, such as grouping tool calls, and tell
+		// pi-tool-groups that this chat shows the side conversation, which it times and tracks separately.
 		const parentChat = mode.chatContainer as unknown as Record<string, unknown>;
 		if (Object.hasOwn(parentChat, "render")) (this.chat as unknown as Record<string, unknown>).render = parentChat.render;
+		(this.chat as unknown as Record<symbol, unknown>)[TOOL_GROUPS_CONVERSATION] = {
+			finishedAt: (message: { timestamp: number }) => this.finished.get(message.timestamp),
+			running: () => this.streaming,
+		};
+		this.recordFinished(this.entries);
 
 		const own = (value: unknown) => ({ value, writable: true, configurable: true });
 		const view = this;
@@ -473,6 +484,10 @@ export class SideView {
 	draw(event: SideEvent): void {
 		if (event.type === "auto_retry_start") this.retryAttempt = event.attempt as number;
 		if (event.type === "agent_start") this.streaming = true;
+		if (event.type === "message_end") {
+			const message = event.message as { role?: string; timestamp?: number };
+			if (message.role === "assistant" && typeof message.timestamp === "number") this.finished.set(message.timestamp, Date.now());
+		}
 		if (event.type === "agent_end") this.streaming = false;
 		if (event.type === "thinking_level_changed") {
 			this.state = { ...this.state, thinkingLevel: event.level as string };
@@ -644,10 +659,19 @@ export class SideView {
 			: added.findIndex((entry) => entry.type === "message" && entry.message.timestamp === until) + 1 || added.length;
 		if (end > 0) {
 			this.entries = [...this.entries, ...added.slice(0, end)];
+			this.recordFinished(added.slice(0, end));
 			this.session = this.mirror();
 		}
 		this.state = state;
 		this.mode.ui.requestRender();
+	}
+
+	/** Takes when turns finished from stored entries, which are written as each turn ends. */
+	private recordFinished(entries: readonly SessionEntry[]): void {
+		for (const entry of entries) {
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			if (!this.finished.has(entry.message.timestamp)) this.finished.set(entry.message.timestamp, Date.parse(entry.timestamp));
+		}
 	}
 
 	private mirror(): SessionManager {
