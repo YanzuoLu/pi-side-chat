@@ -1,7 +1,8 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
-import { handoffMessage, readHandoffConfig } from "../src/handoff.ts";
+import { firstUserMessage, handoffMessage, handoffPrompt, readHandoffConfig } from "../src/handoff.ts";
 
 const cache = join(import.meta.dirname, "../.cache/test");
 
@@ -22,6 +23,46 @@ describe("readHandoffConfig", () => {
 	it("splits the provider from a model id that may contain slashes", () => {
 		expect(config('{ "handoff": { "model": "nv/azure/claude" } }')).toEqual({ model: { provider: "nv", id: "azure/claude" } });
 		expect(() => config('{ "handoff": { "model": "claude" } }')).toThrow(/provider\/model/);
+	});
+});
+
+describe("handoffPrompt", () => {
+	it("asks for proper-compact's headings, in order", () => {
+		const headings = [...handoffPrompt().matchAll(/^## (.+)$/gm)].map((match) => match[1]);
+		expect(headings).toEqual([
+			"Goal",
+			"Constraints & Preferences",
+			"Progress",
+			"Key Decisions",
+			"Next Steps",
+			"Critical Context",
+			"Artifacts and Evidence",
+		]);
+	});
+
+	it("quotes the message the side conversation began with, on one line and cut short", () => {
+		expect(handoffPrompt()).not.toContain("It began with");
+		expect(handoffPrompt('why does "x"\n  fail?')).toContain(`It began with the user's message "why does \\"x\\" fail?".`);
+		expect(handoffPrompt("a".repeat(300))).toContain(`message "${"a".repeat(200)}\u2026".`);
+	});
+});
+
+describe("firstUserMessage", () => {
+	it("takes the text of the first user message", () => {
+		const session = SessionManager.inMemory("/project");
+		session.appendCustomMessageEntry("side-chat", "hidden", false);
+		session.appendMessage({
+			role: "user",
+			content: [
+				{ type: "image", data: "", mimeType: "image/png" },
+				{ type: "text", text: "what is in this image?" },
+			],
+			timestamp: Date.now(),
+		});
+		session.appendMessage({ role: "user", content: "and this one?", timestamp: Date.now() });
+
+		expect(firstUserMessage(session.getEntries())).toBe("what is in this image?");
+		expect(firstUserMessage([])).toBeUndefined();
 	});
 });
 

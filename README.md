@@ -22,7 +22,7 @@ Saved side conversations that are still open when you leave the main session, by
 
 ## Handoff
 
-`ctrl + s` brings what happened in the side conversation back to the main thread. The main thread shows right away while the side conversation writes a handoff: what you asked and found there, decisions and requests you stated (quoted), and anything it changed. The handoff is steered into the main thread, so a working main thread sees it before its next model request and an idle one starts a turn with it. If writing the handoff fails, the side conversation stays open. A side conversation where you have not asked anything just closes.
+`ctrl + s` brings what happened in the side conversation back to the main thread. The main thread shows right away while the side conversation writes a handoff: a checkpoint of the side conversation in the format [proper-compact](https://github.com/sharaf-nassar/proper-pi-extensions) gives its compaction summaries, from goal to artifacts and evidence, with proper-compact's checkpoint contract adapted to a side conversation. The side conversation is told how it relates to the main thread and which message it began with, so it finds its start even after a compaction. The handoff is steered into the main thread, so a working main thread sees it before its next model request and an idle one starts a turn with it. If writing the handoff fails, the side conversation stays open. A side conversation where you have not asked anything just closes.
 
 By default the side conversation's own model and thinking level write the handoff, which reuses its prompt cache. `~/.pi/agent/pi-side-chat.json` can choose others:
 

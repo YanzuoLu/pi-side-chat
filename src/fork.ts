@@ -21,16 +21,20 @@ export interface SideOrigin {
 }
 
 /**
- * The parent session a side conversation was forked from, if these entries belong to one. A side
- * conversation of a side conversation also carries its parent's opening, so the last one counts.
+ * The hidden message that opens the side conversation these entries belong to, if they belong to
+ * one. A side conversation of a side conversation also carries its parent's opening, so the last one
+ * counts.
  */
+export function sideOpening(entries: readonly FileEntry[]): CustomMessageEntry | undefined {
+	return entries.findLast(
+		(entry): entry is CustomMessageEntry =>
+			entry.type === "custom_message" && entry.customType === SIDE_MESSAGE_TYPE && entry.details !== undefined,
+	);
+}
+
+/** The parent session a side conversation was forked from, if these entries belong to one. */
 export function sideOrigin(entries: readonly SessionEntry[]): SideOrigin | undefined {
-	for (const entry of [...entries].reverse()) {
-		if (entry.type === "custom_message" && entry.customType === SIDE_MESSAGE_TYPE && entry.details) {
-			return entry.details as SideOrigin;
-		}
-	}
-	return undefined;
+	return sideOpening(entries)?.details as SideOrigin | undefined;
 }
 
 /**

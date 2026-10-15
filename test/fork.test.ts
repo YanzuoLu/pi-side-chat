@@ -1,7 +1,7 @@
 import { buildSessionContext, SessionManager, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { describe, expect, it } from "vitest";
 import { TURN_ABORTED_MARKER } from "../src/codex.ts";
-import { forkSide, hasStarted, SIDE_OPENING, sideOrigin } from "../src/fork.ts";
+import { forkSide, hasStarted, SIDE_OPENING, sideOpening, sideOrigin } from "../src/fork.ts";
 
 /** A parent session with extension state between messages and a compaction that kept history from such state. */
 function parent() {
@@ -70,6 +70,18 @@ describe("forkSide", () => {
 
 		expect(hidden(false)).toEqual([SIDE_OPENING]);
 		expect(hidden(true)).toEqual([TURN_ABORTED_MARKER, SIDE_OPENING]);
+	});
+});
+
+describe("sideOpening", () => {
+	it("is the last side opening, which a side conversation of a side conversation adds", () => {
+		const side = fork(parent()).slice(1) as SessionEntry[];
+		const nested = forkSide({ ...sideHeader, id: "nested-id" }, side, false, { parentSessionId: "side-id" }).slice(1) as SessionEntry[];
+
+		expect(sideOpening(side)).toBe(side.at(-1));
+		expect(sideOpening(nested)?.id).toBe(nested.at(-1)!.id);
+		expect(sideOrigin(nested)).toEqual({ parentSessionId: "side-id" });
+		expect(sideOpening(parent().getBranch())).toBeUndefined();
 	});
 });
 

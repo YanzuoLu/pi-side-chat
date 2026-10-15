@@ -30,8 +30,8 @@ import {
 	SIDE_SLASH_COMMAND_UNAVAILABLE_HINT,
 	SIDE_STARTING_CONTEXT_LABEL,
 } from "./codex.ts";
-import { forkSide, hasStarted, sideOrigin } from "./fork.ts";
-import { HANDOFF_PROMPT, handoffMessage, readHandoffConfig } from "./handoff.ts";
+import { forkSide, hasStarted, sideOpening, sideOrigin } from "./fork.ts";
+import { firstUserMessage, handoffMessage, handoffPrompt, readHandoffConfig } from "./handoff.ts";
 import { findInteractiveMode, SideView } from "./view.ts";
 
 const KEY = "side-chat";
@@ -61,6 +61,8 @@ type Side = {
 	streaming: boolean;
 	/** When the side conversation was forked from the main thread. */
 	forkedAt: string;
+	/** The id of the hidden message that opens the side conversation, after which its own entries come. */
+	opening?: string;
 	/** Whether the user has said anything in the side conversation. */
 	asked: boolean;
 	/** Whether the side conversation is writing its handoff. */
@@ -74,6 +76,7 @@ function newSide(
 	view: SideView,
 	sessionFile: string,
 	sessionDir: string,
+	opening: string | undefined,
 	temporary?: string,
 ): Side {
 	return {
@@ -85,6 +88,7 @@ function newSide(
 		commands: new Set(),
 		streaming: false,
 		forkedAt: header.timestamp,
+		opening,
 		asked: false,
 		handingOff: false,
 	};
@@ -289,7 +293,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 		const view = new SideView(findInteractiveMode(context, KEY), entries, { model, thinkingLevel: thinking });
 		writeFileSync(sessionFile, `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 		const sideModel = { provider: model.provider, id: model.id, thinking };
-		await launch(context, newSide(sideHeader, view, sessionFile, sessionDir, temporary), sideModel, message);
+		const side = newSide(sideHeader, view, sessionFile, sessionDir, sideOpening(entries)?.id, temporary);
+		await launch(context, side, sideModel, message);
 	};
 
 	/** Opens a side conversation saved by this session again, without showing it. */
@@ -304,7 +309,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 			model,
 			thinkingLevel: pi.getThinkingLevel(),
 		});
-		const current = newSide(header, view, sessionFile, dirname(sessionFile));
+		const current = newSide(header, view, sessionFile, dirname(sessionFile), sideOpening(entries)?.id);
 		current.asked = true;
 		view.replay();
 		await launch(context, current, undefined);
@@ -346,7 +351,8 @@ export default function sideChat(pi: ExtensionAPI): void {
 				if (config.model) await child.setModel(config.model.provider, config.model.id);
 				await child.setThinkingLevel(config.thinking ?? own.thinkingLevel);
 			}
-			const handoff = await child.reply(HANDOFF_PROMPT);
+			const first = current.opening ? firstUserMessage(await child.entries(current.opening)) : undefined;
+			const handoff = await child.reply(handoffPrompt(first));
 			if (!sides.includes(current)) return;
 			pi.sendMessage(
 				{ customType: "side-handoff", content: handoffMessage(handoff, current.forkedAt), display: true },
