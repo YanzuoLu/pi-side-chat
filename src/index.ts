@@ -35,10 +35,10 @@ import { firstUserMessage, handoffMessage, handoffPrompt, readHandoffConfig } fr
 import { findInteractiveMode, SideView } from "./view.ts";
 
 const KEY = "side-chat";
-const TOGGLE_LABEL = "ctrl + /";
-const SWITCH_LABEL = "shift + ←/→";
-const CLOSE_LABEL = "ctrl + c";
-const HANDOFF_LABEL = "ctrl + s";
+const TOGGLE_LABEL = "ctrl+/";
+const SWITCH_LABEL = "shift+←/→";
+const CLOSE_LABEL = "ctrl+c";
+const HANDOFF_LABEL = "ctrl+s";
 const HANDING_OFF_LABEL = "Side summarizing...";
 const CONFIG_FILE = "pi-side-chat.json";
 const COMMANDS = ["side", "btw"];
