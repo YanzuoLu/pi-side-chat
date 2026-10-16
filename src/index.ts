@@ -154,7 +154,12 @@ export default function sideChat(pi: ExtensionAPI): void {
 		updateLabel();
 	};
 
-	const close = async (current: Side) => {
+	/** What the main thread's transcript says when `current` ended this way, with how to resume it if it is saved. */
+	const endNotice = (current: Side, ending: string) =>
+		current.temporary ? ending : `${ending}. Resume it with: pi --session ${current.id}`;
+
+	/** Closes `current`. A saved one tells the main thread how to resume it, unless the main thread was `told` already. */
+	const close = async (current: Side, told = false) => {
 		const index = sides.indexOf(current);
 		if (index < 0) return;
 		sides.splice(index, 1);
@@ -165,7 +170,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 		await current.process?.close();
 		if (current.temporary) rmSync(current.temporary, { recursive: true, force: true });
 		else if (!current.asked) rmSync(current.sessionFile, { force: true });
-		else if (!leaving) ctx?.ui.notify(`Side conversation saved. Resume it with: pi --session ${current.id}`, "info");
+		else if (!leaving && !told) ctx?.ui.notify(endNotice(current, "Side conversation saved"), "info");
 	};
 
 	const submit = (current: Side, text: string) => {
@@ -354,11 +359,14 @@ export default function sideChat(pi: ExtensionAPI): void {
 			const first = current.opening ? firstUserMessage(await child.entries(current.opening)) : undefined;
 			const handoff = await child.reply(handoffPrompt(first));
 			if (!sides.includes(current)) return;
+			// A working main thread shows the handoff only once it is delivered, so its transcript, and not
+			// its model, is told right away that the handoff was steered there.
+			ctx?.ui.notify(endNotice(current, "Side conversation handed off (steer)"), "info");
 			pi.sendMessage(
 				{ customType: "side-handoff", content: handoffMessage(handoff, current.forkedAt), display: true },
 				{ deliverAs: "steer", triggerTurn: true },
 			);
-			await close(current);
+			await close(current, true);
 		} catch (error) {
 			if (!sides.includes(current)) return;
 			current.handingOff = false;
@@ -485,7 +493,7 @@ export default function sideChat(pi: ExtensionAPI): void {
 		stopKeys?.();
 		stopKeys = undefined;
 		leaving = true;
-		await Promise.all([...sides].map(close));
+		await Promise.all([...sides].map((side) => close(side)));
 		ctx?.ui.setWidget(KEY, undefined);
 		ctx = undefined;
 	});
