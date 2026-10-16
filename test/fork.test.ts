@@ -51,13 +51,12 @@ describe("forkSide", () => {
 		expect(llmView(entries).slice(0, -1)).toEqual(llmView(session.getBranch()));
 	});
 
-	it("is named by its own session id instead of the parent's name", () => {
+	it("starts unnamed instead of taking the parent's name", () => {
 		const session = parent();
 		session.appendSessionInfo("main thread");
 		const entries = fork(session).slice(1) as SessionEntry[];
-		const names = entries.flatMap((entry) => (entry.type === "session_info" ? [entry.name] : []));
 
-		expect(names).toEqual(["side-id"]);
+		expect(entries.some((entry) => entry.type === "session_info")).toBe(false);
 		entries.forEach((entry, index) => expect(entry.parentId).toBe(entries[index - 1]?.id ?? null));
 	});
 

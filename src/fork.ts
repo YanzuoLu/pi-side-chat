@@ -42,8 +42,8 @@ export function sideOrigin(entries: readonly SessionEntry[]): SideOrigin | undef
  *
  * It keeps everything the model sees. Extension state entries (`custom`)
  * are dropped so that extensions in the side conversation start fresh instead of resuming the parent's
- * loops and plans. The parent's session names are dropped too: the side conversation is named by its
- * own session id, which tells it apart from the parent in session lists. Compactions that kept history
+ * loops and plans. The parent's session names are dropped too, so the side conversation starts unnamed
+ * like any new session instead of being listed under the parent's name. Compactions that kept history
  * from a dropped entry keep it from the next kept entry, which contributes the same messages. A turn
  * still running in the parent is marked as interrupted, as Codex does, and the side instructions come
  * last, ready for the first side message.
@@ -77,25 +77,19 @@ export function forkSide(
 			append(entry);
 		}
 	}
-	append({ type: "session_info", id: newId(entries), parentId: null, timestamp: new Date().toISOString(), name: header.id });
 	if (midTurn) append(hiddenMessage(TURN_ABORTED_MARKER, entries));
 	append({ ...hiddenMessage(SIDE_OPENING, entries), details: origin });
 	return [header, ...entries];
 }
 
-/** An entry id that none of `existing` has. */
-function newId(existing: readonly SessionEntry[]): string {
+function hiddenMessage(content: string, existing: readonly SessionEntry[]): CustomMessageEntry {
 	const ids = new Set(existing.map((entry) => entry.id));
 	let id: string;
 	do id = randomUUID().slice(0, 8);
 	while (ids.has(id));
-	return id;
-}
-
-function hiddenMessage(content: string, existing: readonly SessionEntry[]): CustomMessageEntry {
 	return {
 		type: "custom_message",
-		id: newId(existing),
+		id,
 		parentId: null,
 		timestamp: new Date().toISOString(),
 		customType: SIDE_MESSAGE_TYPE,
