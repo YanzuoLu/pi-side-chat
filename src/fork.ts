@@ -42,9 +42,11 @@ export function sideOrigin(entries: readonly SessionEntry[]): SideOrigin | undef
  *
  * It keeps everything the model sees. Extension state entries (`custom`)
  * are dropped so that extensions in the side conversation start fresh instead of resuming the parent's
- * loops and plans. Compactions that kept history from a dropped entry keep it from the next kept entry,
- * which contributes the same messages. A turn still running in the parent is marked as interrupted, as
- * Codex does, and the side instructions come last, ready for the first side message.
+ * loops and plans. The parent's session names are dropped too: the side conversation is named by its
+ * own session id, which tells it apart from the parent in session lists. Compactions that kept history
+ * from a dropped entry keep it from the next kept entry, which contributes the same messages. A turn
+ * still running in the parent is marked as interrupted, as Codex does, and the side instructions come
+ * last, ready for the first side message.
  */
 export function forkSide(
 	header: SessionHeader,
@@ -52,12 +54,13 @@ export function forkSide(
 	midTurn: boolean,
 	origin: SideOrigin,
 ): FileEntry[] {
-	const kept = branch.filter((entry) => entry.type !== "custom");
+	const dropped = (entry: SessionEntry) => entry.type === "custom" || entry.type === "session_info";
+	const kept = branch.filter((entry) => !dropped(entry));
 	const keptAfter = new Map<string, string | undefined>();
 	let next: string | undefined;
 	for (let index = branch.length - 1; index >= 0; index--) {
 		const entry = branch[index]!;
-		if (entry.type !== "custom") next = entry.id;
+		if (!dropped(entry)) next = entry.id;
 		keptAfter.set(entry.id, next);
 	}
 
@@ -74,19 +77,25 @@ export function forkSide(
 			append(entry);
 		}
 	}
+	append({ type: "session_info", id: newId(entries), parentId: null, timestamp: new Date().toISOString(), name: header.id });
 	if (midTurn) append(hiddenMessage(TURN_ABORTED_MARKER, entries));
 	append({ ...hiddenMessage(SIDE_OPENING, entries), details: origin });
 	return [header, ...entries];
 }
 
-function hiddenMessage(content: string, existing: readonly SessionEntry[]): CustomMessageEntry {
+/** An entry id that none of `existing` has. */
+function newId(existing: readonly SessionEntry[]): string {
 	const ids = new Set(existing.map((entry) => entry.id));
 	let id: string;
 	do id = randomUUID().slice(0, 8);
 	while (ids.has(id));
+	return id;
+}
+
+function hiddenMessage(content: string, existing: readonly SessionEntry[]): CustomMessageEntry {
 	return {
 		type: "custom_message",
-		id,
+		id: newId(existing),
 		parentId: null,
 		timestamp: new Date().toISOString(),
 		customType: SIDE_MESSAGE_TYPE,
